@@ -1,0 +1,1577 @@
+# Energy M&V Engine v5.1 — outlier schema enforcement + modeled usage columns
+"""
+Energy M&V Baseline Optimization Engine — Sigma Computing Python Element
+=========================================================================
+IPMVP Option C  |  Version 1.0  |  April 2026
+
+HOW TO USE IN SIGMA
+-------------------
+1. Place this code in a Python element on Sheet 2 (Optimization & Models).
+2. Connect the upstream Input Table (Sheet 1 CSV upload) as the input source.
+   Sigma passes it in as a pandas DataFrame via the variable defined in
+   `INPUT_TABLE_VAR` below — match this to whatever Sigma names it.
+3. The element returns a dict of DataFrames. Wire each one to a Sigma Table
+   element on the sheet:
+       results["individual_models"]   → Individual Models table
+       results["aggregated_models"]   → Aggregated Models table
+       results["baseline_bills"]      → Baseline Bill Detail table
+       results["reporting_bills"]     → Reporting Bill Detail table
+       results["outliers"]            → Outlier Detail table
+
+REQUIRED PACKAGES  (all available via pip in Sigma's Python environment)
+------------------------------------------------------------------------
+    pandas, numpy, scikit-learn  (sklearn)
+
+EXPECTED INPUT COLUMNS
+-----------------------
+    Site Name, Meter Number, Service Type,
+    Period Start Date, Period End Date,
+    HDD, CDD, Consumption, Total Charges,
+    Commission Date  (REQUIRED — used to determine baseline vs. reporting periods)
+    Consumption Unit (optional — omit or leave blank if data is already in standard units)
+"""
+
+# ─── Sigma wires the upstream table into this variable name ──────────────────
+# Change this to match the actual variable name Sigma assigns to your input table.
+INPUT_TABLE_VAR = "mv_input"          # <- edit if Sigma names it differently
+
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_squared_error
+from itertools import combinations
+import warnings
+warnings.filterwarnings("ignore")
+
+# ─── Quality thresholds ───────────────────────────────────────────────────────
+ELEC_R2_THRESHOLD        = 0.70
+GAS_R2_THRESHOLD         = 0.40
+CVRMSE_THRESHOLD         = 15.0   # percent  (ASHRAE Guideline 14)
+WEATHER_COVERAGE_THRESHOLD = 75.0 # percent  (hard requirement)
+ELEC_BASELINE_COUNT      = 12
+GAS_BASELINE_COUNT       = 8
+PREFERRED_MIN_PER_QUARTER = 2
+MINIMUM_MIN_PER_QUARTER   = 1
+OVERLAP_THRESHOLD         = 3     # shared periods to classify meters as concurrent
+
+# Temporal balance — hard CV ceiling applied during pre-filtering.
+# Combinations exceeding this are excluded for normal (full-year) sites.
+# New sites (<12 months baseline) bypass this ceiling entirely.
+TEMPORAL_CV_CEILING       = 40.0  # % — IPMVP Option C seasonal balance (strict, allows mild imbalance like 4/3/3/2)
+
+# ── Meter weighting (concurrent multi-meter sites only) ───────────────────────
+# Weight = each meter's share of total BASELINE consumption at the site.
+# Meters with no baseline bills receive 0% weight and a note in Weight Source.
+#
+# FAILING-METER flags (applied to aggregate row and Meter Weights table):
+#   Failing weight <= WEIGHT_REVIEW_THRESHOLD  → "OK"
+#   Failing weight >  WEIGHT_REVIEW_THRESHOLD
+#                  <= WEIGHT_HIGH_RISK_THRESHOLD → "REVIEW"   (informational)
+#   Failing weight >  WEIGHT_HIGH_RISK_THRESHOLD → "HIGH RISK" (informational)
+# No hard exclusions — Model Passes Quality is never forced False by weight logic.
+#
+# LOW-COVERAGE flag (applied to individual model rows only):
+#   Passing meter with weight < LOW_COVERAGE_THRESHOLD → "LOW COVERAGE"
+#   Signals that the meter's contribution to any aggregate is small.
+#
+# Meter Weight (%) is ALWAYS populated for concurrent multi-meter sites
+# so analysts can read the distribution without needing a flag to fire.
+WEIGHT_REVIEW_THRESHOLD    = 0.33   # >33% failing weight → REVIEW
+WEIGHT_HIGH_RISK_THRESHOLD = 0.50   # >50% failing weight → HIGH RISK
+LOW_COVERAGE_THRESHOLD     = 0.25   # <25% weight on a passing individual meter → LOW COVERAGE
+MAX_COMBINATIONS          = 500  # max candidates tested per site
+
+# Unit conversions to standard units (kWh for electricity, Therms for gas)
+UNIT_CONVERSIONS = {
+    "kwh": 1.0, "mwh": 1000.0, "wh": 0.001,
+    "therms": 1.0, "therm": 1.0,
+    "ccf": 1.037, "mcf": 10.37,
+    "mmbtu": 10.0, "mmbtu": 10.0,
+}
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _is_gas(service_type: str) -> bool:
+    return "gas" in str(service_type).lower()
+
+
+def _convert_units(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert Consumption to standard units where Consumption_Unit is populated."""
+    if "Consumption_Unit" not in df.columns:
+        return df
+    df = df.copy()
+    for unit_raw, group_idx in df.groupby("Consumption_Unit").groups.items():
+        unit_key = str(unit_raw).strip().lower()
+        factor = UNIT_CONVERSIONS.get(unit_key)
+        if factor is not None and factor != 1.0:
+            df.loc[group_idx, "Consumption"] = df.loc[group_idx, "Consumption"] * factor
+    return df
+
+
+def _infer_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derive Baseline_Bill and Reporting_Bill flags from Commission Date.
+    Bills with Period Start Date strictly before Commission Date → Baseline.
+    Bills with Period Start Date on or after Commission Date → Reporting.
+    Commission Date must be present and populated; raises ValueError otherwise.
+    """
+    df = df.copy()
+
+    if "Commission_Date" not in df.columns or df["Commission_Date"].isna().all():
+        raise ValueError(
+            "The template requires a 'Commission Date' column with a date value for every site. "
+            "Bills before this date are treated as baseline; bills on/after are reporting."
+        )
+
+    df["Commission_Date"] = pd.to_datetime(df["Commission_Date"], errors="coerce")
+    # Strip timezone info so date comparisons work regardless of tz-awareness
+    df["Commission_Date"]    = df["Commission_Date"].dt.tz_localize(None) if df["Commission_Date"].dt.tz is not None else df["Commission_Date"]
+    df["Period_Start_Date"]  = df["Period_Start_Date"].dt.tz_localize(None) if df["Period_Start_Date"].dt.tz is not None else df["Period_Start_Date"]
+    df["Baseline_Bill"]   = (df["Period_Start_Date"] < df["Commission_Date"]).astype(int)
+    df["Reporting_Bill"]  = (df["Period_Start_Date"] >= df["Commission_Date"]).astype(int)
+    return df
+
+
+def _calc_cvrmse(actual: np.ndarray, predicted: np.ndarray) -> float:
+    rmse = np.sqrt(mean_squared_error(actual, predicted))
+    mean_a = np.mean(actual)
+    return (rmse / mean_a * 100) if mean_a != 0 else 999.0
+
+
+def _weather_coverage(selected: pd.DataFrame, all_baseline: pd.DataFrame):
+    """Returns (overall%, hdd%, cdd%)."""
+    def cov(col):
+        full_r = all_baseline[col].max() - all_baseline[col].min()
+        sel_r  = selected[col].max()    - selected[col].min()
+        return (sel_r / full_r * 100) if full_r > 0 else 100.0
+    hdd_c = cov("HDD")
+    cdd_c = cov("CDD")
+    return (hdd_c + cdd_c) / 2, hdd_c, cdd_c
+
+
+def _seasonal_ok(selected: pd.DataFrame, min_per_q: int) -> bool:
+    counts = selected["Period_Start_Date"].dt.quarter.value_counts()
+    return all(counts.get(q, 0) >= min_per_q for q in [1, 2, 3, 4])
+
+
+def _n_choose_k(n, k):
+    if k > n: return 0
+    k = min(k, n - k)
+    r = 1
+    for i in range(k):
+        r = r * (n - i) // (i + 1)
+    return r
+
+
+def _random_combos(n, k, count):
+    # Fixed seed ensures identical results every run for the same input data.
+    # The seed is derived from n and k so different sites/meters get different
+    # random sequences, but each site always gets the same sequence.
+    rng = np.random.default_rng(seed=(n * 1000 + k))
+    seen, attempts = set(), 0
+    while len(seen) < count and attempts < count * 4:
+        c = tuple(sorted(rng.choice(n, k, replace=False)))
+        if c not in seen:
+            seen.add(c)
+            yield c
+        attempts += 1
+
+
+# ─── Outlier detection ────────────────────────────────────────────────────────
+
+def _baseline_outliers(bills: pd.DataFrame):
+    if len(bills) < 2:
+        return bills, pd.DataFrame()
+    cons = bills["Consumption"]
+    outlier_idx, reasons = [], {}
+
+    # Zero / negative
+    zero_mask = cons <= 0
+    for i in bills[zero_mask].index:
+        outlier_idx.append(i)
+        reasons[i] = "Zero/Negative Consumption"
+
+    # IQR on positives
+    pos = bills[~zero_mask]
+    if len(pos) >= 4:
+        q1, q3 = pos["Consumption"].quantile(0.25), pos["Consumption"].quantile(0.75)
+        iqr = q3 - q1
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        for i, row in pos.iterrows():
+            v = row["Consumption"]
+            if v < lo:
+                outlier_idx.append(i); reasons[i] = f"Too Low (< {lo:.0f})"
+            elif v > hi:
+                outlier_idx.append(i); reasons[i] = f"Too High (> {hi:.0f})"
+
+    outlier_idx = list(set(outlier_idx))
+    if not outlier_idx:
+        return bills, pd.DataFrame()
+
+    outliers = bills.loc[outlier_idx].copy()
+    outliers["Outlier_Type"]   = "Baseline"
+    outliers["Outlier_Reason"] = outliers.index.map(reasons)
+    clean = bills.drop(index=outlier_idx)
+    return clean, outliers  # kept untrimmed — safe_df enforces schema
+
+
+def _reporting_outliers(model, bills: pd.DataFrame, is_gas: bool):
+    if len(bills) < 1:
+        return bills, pd.DataFrame()
+    X = bills[["HDD"]].values if is_gas else bills[["HDD", "CDD"]].values
+    pred = model.predict(X)
+    actual = bills["Consumption"].values
+    pct = np.where(pred != 0, (pred - actual) / pred * 100, 0)
+    mask = (pct < -10) | (pct > 40)
+    outliers = bills[mask].copy()
+    clean    = bills[~mask].copy()
+    if len(outliers) > 0:
+        outliers["Outlier_Type"]   = "Reporting"
+        outliers["Outlier_Reason"] = [
+            f"% Avoided {p:.1f}% ({'< -10%' if p < -10 else '> 40%'})"
+            for p in pct[mask]
+        ]
+        outliers["Pct_Avoided"] = pct[mask]
+    return clean, outliers  # kept untrimmed — needed by _build_reporting_rows
+
+
+# ─── Model fitting ────────────────────────────────────────────────────────────
+
+def _fit_model(baseline: pd.DataFrame, is_gas: bool):
+    X = baseline[["HDD"]].values if is_gas else baseline[["HDD", "CDD"]].values
+    y = baseline["Consumption"].values
+    m = LinearRegression().fit(X, y)
+    pred = m.predict(X)
+    r2   = r2_score(y, pred)
+    cvrm = _calc_cvrmse(y, pred)
+    return m, r2, cvrm
+
+
+def _eval_combo(idx_list, baseline_pool, reporting_bills, all_baseline,
+                r2_thresh, is_gas, site_id, service_type):
+    selected = baseline_pool.iloc[list(idx_list)]
+    m, r2, cvrmse = _fit_model(selected, is_gas)
+
+    wc, hdd_c, cdd_c = _weather_coverage(selected, all_baseline)
+    temporal_cv = 0.0
+    qcounts = selected["Period_Start_Date"].dt.quarter.value_counts()
+    if len(qcounts) > 1:
+        temporal_cv = qcounts.std() / qcounts.mean() * 100
+
+    passes_r2   = r2     >= r2_thresh
+    passes_cv   = cvrmse <= CVRMSE_THRESHOLD
+    passes_wc   = wc     >= WEATHER_COVERAGE_THRESHOLD
+    passes_all  = passes_r2 and passes_cv and passes_wc
+
+    # Reporting savings
+    clean_rep, rep_outliers = _reporting_outliers(m, reporting_bills, is_gas)
+    if len(clean_rep) > 0:
+        X_rep = clean_rep[["HDD"]].values if is_gas else clean_rep[["HDD", "CDD"]].values
+        pred_rep = m.predict(X_rep)
+        avoided  = pred_rep.sum() - clean_rep["Consumption"].sum()
+        pct_avd  = avoided / pred_rep.sum() * 100 if pred_rep.sum() > 0 else 0.0
+    else:
+        avoided, pct_avd = 0.0, 0.0
+        pred_rep = np.array([])
+
+    intercept = m.intercept_
+    hdd_coef  = m.coef_[0]
+    cdd_coef  = m.coef_[1] if not is_gas else 0.0
+    if is_gas:
+        equation = f"Consumption = {intercept:.2f} + {hdd_coef:.4f}*HDD"
+    else:
+        equation = f"Consumption = {intercept:.2f} + {hdd_coef:.4f}*HDD + {cdd_coef:.4f}*CDD"
+
+    q_dist = {f"Q{q}_Bills": int(qcounts.get(q, 0)) for q in [1, 2, 3, 4]}
+
+    return {
+        "model":           m,
+        "selected":        selected,
+        "clean_reporting": clean_rep,
+        "rep_outliers":    rep_outliers,
+        "predicted_rep":   pred_rep,
+        "equation":        equation,
+        "intercept":       intercept,
+        "hdd_coef":        hdd_coef,
+        "cdd_coef":        cdd_coef,
+        "r2":              r2,
+        "cvrmse":          cvrmse,
+        "wc_overall":      wc,
+        "wc_hdd":          hdd_c,
+        "wc_cdd":          cdd_c,
+        "temporal_cv":     temporal_cv,
+        "passes_r2":       passes_r2,
+        "passes_cvrmse":   passes_cv,
+        "passes_wc":       passes_wc,
+        "passes_all":      passes_all,
+        "total_avoided":   avoided,
+        "pct_avoided":     pct_avd,
+        "reporting_count": len(clean_rep),
+        **q_dist,
+    }
+
+
+# ─── Optimizer ────────────────────────────────────────────────────────────────
+
+def _optimize_from_locked(site_id: str, service_type: str,
+                          bills: "pd.DataFrame", r2_thresh: float):
+    """
+    Reconstruct a model from pre-selected baseline bills (Selected_Baseline column).
+    Used when the dataset already has an optimization run recorded.
+    Returns the same (result, bl_outliers, rep_outliers) tuple as _optimize().
+    """
+    is_gas = _is_gas(service_type)
+
+    # Handle float 1.0 (from CSV NaN/float conversion) as well as string "1"
+    baseline_bills  = bills[
+        bills["Selected_Baseline"].apply(lambda v: str(v).strip() in ("1", "1.0"))
+    ].copy()
+    reporting_bills = bills[bills["Reporting_Bill"] == 1].copy()
+
+    if len(baseline_bills) == 0:
+        # No locked baseline for this meter — fall through to normal optimization
+        return None, [], []
+
+    baseline_bills["Period_Start_Date"] = pd.to_datetime(
+        baseline_bills["Period_Start_Date"], errors="coerce"
+    )
+
+    model, r2, cvrmse = _fit_model(baseline_bills, is_gas)
+    wc, hdd_c, cdd_c  = _weather_coverage(baseline_bills, baseline_bills)
+    qcounts = baseline_bills["Period_Start_Date"].dt.quarter.value_counts()
+
+    passes_r2    = r2     >= r2_thresh
+    passes_cv    = cvrmse <= CVRMSE_THRESHOLD
+    passes_wc    = wc     >= WEATHER_COVERAGE_THRESHOLD
+    passes_all   = passes_r2 and passes_cv and passes_wc
+
+    clean_rep, rep_outliers = _reporting_outliers(model, reporting_bills, is_gas)
+
+    if len(clean_rep) > 0:
+        X_rep = clean_rep[["HDD"]].values if is_gas else clean_rep[["HDD", "CDD"]].values
+        pred_rep  = model.predict(X_rep)
+        avoided   = pred_rep.sum() - clean_rep["Consumption"].sum()
+        pct_avd   = avoided / pred_rep.sum() * 100 if pred_rep.sum() > 0 else 0.0
+    else:
+        avoided, pct_avd, pred_rep = 0.0, 0.0, np.array([])
+
+    hdd_coef = model.coef_[0]
+    cdd_coef = model.coef_[1] if not is_gas else 0.0
+    if is_gas:
+        equation = f"Consumption = {model.intercept_:.2f} + {hdd_coef:.4f}*HDD"
+    else:
+        equation = f"Consumption = {model.intercept_:.2f} + {hdd_coef:.4f}*HDD + {cdd_coef:.4f}*CDD"
+
+    temporal_cv = 0.0
+    if len(qcounts) > 1:
+        temporal_cv = qcounts.std() / qcounts.mean() * 100
+
+    # Check if locked selection exceeds CV ceiling for non-new sites
+    is_new_locked = _is_new_site(baseline_bills)
+    cv_relaxed_locked = (
+        not is_new_locked
+        and temporal_cv > TEMPORAL_CV_CEILING
+    )
+
+    q_dist = {f"Q{q}_Bills": int(qcounts.get(q, 0)) for q in [1, 2, 3, 4]}
+
+    result = {
+        "model":               model,
+        "selected":            baseline_bills,
+        "clean_reporting":     clean_rep,
+        "rep_outliers":        rep_outliers,
+        "predicted_rep":       pred_rep,
+        "equation":            equation,
+        "intercept":           model.intercept_,
+        "hdd_coef":            hdd_coef,
+        "cdd_coef":            cdd_coef,
+        "r2":                  r2,
+        "cvrmse":              cvrmse,
+        "wc_overall":          wc,
+        "wc_hdd":              hdd_c,
+        "wc_cdd":              cdd_c,
+        "temporal_cv":         temporal_cv,
+        "passes_r2":           passes_r2,
+        "passes_cvrmse":       passes_cv,
+        "passes_wc":           passes_wc,
+        "passes_all":          passes_all,
+        "total_avoided":       avoided,
+        "pct_avoided":         pct_avd,
+        "reporting_count":     len(clean_rep),
+        "seasonal_strategy":   "Locked (pre-selected)",
+        "is_new_site":         is_new_locked,
+        "cv_ceiling_relaxed":  cv_relaxed_locked,
+        "reporting_all":       reporting_bills,
+        "bl_outliers_df":      pd.DataFrame(),
+        **q_dist,
+    }
+    return result, [], list(rep_outliers.to_dict("records")) if len(rep_outliers) > 0 else []
+
+
+def _is_new_site(baseline_bills) -> bool:
+    """Returns True if baseline period spans < 12 months (new site)."""
+    if len(baseline_bills) == 0: return True
+    dates = pd.to_datetime(baseline_bills["Period_Start_Date"], errors="coerce").dropna()
+    if len(dates) == 0: return True
+    return (dates.max() - dates.min()).days < 365
+
+
+def _combo_score(r2, temporal_cv, pct_avoided, reporting_count, max_reporting, is_new):
+    """Weighted composite score. Higher is better.
+    Normal: 0.45*R2 + 0.30*CV_inverted + 0.15*pct + 0.10*rep_frac
+    New site: 0.75*R2 + 0.15*pct + 0.10*rep_frac (CV skipped)
+    """
+    r2_n  = max(0.0, min(1.0, r2))
+    cv_n  = max(0.0, 1.0 - temporal_cv / 100.0)
+    pct_n = (max(-10.0, min(40.0, pct_avoided)) + 10.0) / 50.0
+    rep_n = (reporting_count / max_reporting) if max_reporting > 0 else 0.0
+    if is_new:
+        return 0.75 * r2_n + 0.15 * pct_n + 0.10 * rep_n
+    return 0.45 * r2_n + 0.30 * cv_n + 0.15 * pct_n + 0.10 * rep_n
+
+
+def _optimize(site_id, service_type, bills, baseline_count, r2_thresh):
+    is_gas = _is_gas(service_type)
+
+    raw_baseline  = bills[bills["Baseline_Bill"] == 1].copy()
+    reporting_all = bills[bills["Reporting_Bill"] == 1].copy()
+
+    if len(raw_baseline) == 0:
+        return None, [], []
+
+    clean_baseline, bl_outliers = _baseline_outliers(raw_baseline)
+
+    if len(clean_baseline) < baseline_count:
+        return None, list(bl_outliers.to_dict("records")), []
+
+    clean_baseline = clean_baseline.copy()
+    clean_baseline["Period_Start_Date"] = pd.to_datetime(clean_baseline["Period_Start_Date"])
+    is_new = _is_new_site(clean_baseline)
+    cv_relaxed = False
+
+    def _run_strategy(min_per_q):
+        n = len(clean_baseline)
+        total = _n_choose_k(n, baseline_count)
+        combos = (
+            combinations(range(n), baseline_count)
+            if total <= MAX_COMBINATIONS
+            else _random_combos(n, baseline_count, MAX_COMBINATIONS * 3)
+        )
+
+        valid = []
+        for c in combos:
+            sel = clean_baseline.iloc[list(c)]
+            if not _seasonal_ok(sel, min_per_q):
+                continue
+            wc, _, _ = _weather_coverage(sel, clean_baseline)
+            if wc < WEATHER_COVERAGE_THRESHOLD:
+                continue
+            # CV ceiling: exclude heavily skewed combos for normal sites
+            if not is_new:
+                qc = sel["Period_Start_Date"].dt.quarter.value_counts()
+                if len(qc) > 1 and qc.std() / qc.mean() * 100 > TEMPORAL_CV_CEILING:
+                    continue
+            valid.append(c)
+            if len(valid) >= MAX_COMBINATIONS:
+                break
+
+        # Fallback: relax CV ceiling if it filtered everything out
+        if not valid and not is_new:
+            nonlocal cv_relaxed
+            cv_relaxed = True
+            combos2 = (
+                combinations(range(n), baseline_count)
+                if total <= MAX_COMBINATIONS
+                else _random_combos(n, baseline_count, MAX_COMBINATIONS * 3)
+            )
+            for c in combos2:
+                sel = clean_baseline.iloc[list(c)]
+                if not _seasonal_ok(sel, min_per_q): continue
+                wc, _, _ = _weather_coverage(sel, clean_baseline)
+                if wc < WEATHER_COVERAGE_THRESHOLD: continue
+                valid.append(c)
+                if len(valid) >= MAX_COMBINATIONS: break
+
+        if not valid:
+            return None
+
+        best_pass, best_fail = None, None
+        best_pass_score = -np.inf
+        best_fail_score = -np.inf
+        max_rep = len(reporting_all)
+
+        for c in valid:
+            res = _eval_combo(c, clean_baseline, reporting_all, clean_baseline,
+                              r2_thresh, is_gas, site_id, service_type)
+            score = _combo_score(
+                r2=res["r2"], temporal_cv=res["temporal_cv"],
+                pct_avoided=res["pct_avoided"],
+                reporting_count=res["reporting_count"],
+                max_reporting=max_rep, is_new=is_new,
+            )
+            if res["passes_all"]:
+                if score > best_pass_score:
+                    best_pass_score, best_pass = score, res
+            else:
+                if score > best_fail_score:
+                    best_fail_score, best_fail = score, res
+
+        return best_pass or best_fail
+
+    result = _run_strategy(PREFERRED_MIN_PER_QUARTER)
+    strategy = f"Optimal (≥{PREFERRED_MIN_PER_QUARTER} bills per quarter)"
+    if result is None:
+        result = _run_strategy(MINIMUM_MIN_PER_QUARTER)
+        strategy = f"Acceptable (≥{MINIMUM_MIN_PER_QUARTER} bill per quarter)"
+
+    if result is None:
+        return None, list(bl_outliers.to_dict("records")), []
+
+    result["seasonal_strategy"] = strategy
+    result["is_new_site"]        = is_new
+    result["cv_ceiling_relaxed"] = cv_relaxed
+    result["bl_outliers_df"]    = bl_outliers
+    result["reporting_all"]     = reporting_all
+    return result, list(bl_outliers.to_dict("records")), list(result["rep_outliers"].to_dict("records"))
+
+
+# ─── Multi-meter handling ─────────────────────────────────────────────────────
+
+def _meters_concurrent(site_data: pd.DataFrame) -> bool:
+    """Return True if any two meters share ≥ OVERLAP_THRESHOLD billing periods."""
+    meters = [m for m in site_data["Meter_Number"].dropna().unique()]
+    if len(meters) < 2:
+        return False
+    for i in range(len(meters)):
+        for j in range(i + 1, len(meters)):
+            s1 = set(site_data[site_data["Meter_Number"] == meters[i]]["Period_Start_Date"])
+            s2 = set(site_data[site_data["Meter_Number"] == meters[j]]["Period_Start_Date"])
+            if len(s1 & s2) >= OVERLAP_THRESHOLD:
+                return True
+    return False
+
+
+def _aggregate_site(site_data: pd.DataFrame) -> pd.DataFrame:
+    """Sum consumption + charges per billing period across all meters."""
+    agg_cols = {
+        "Consumption":   "sum",
+        "Total_Charges": "sum",
+        "HDD":           "first",
+        "CDD":           "first",
+        "Service_Type":  "first",
+        "Site_Name":     "first",
+    }
+    for opt in ["Baseline_Bill", "Reporting_Bill", "Commission_Date"]:
+        if opt in site_data.columns:
+            agg_cols[opt] = "first"
+    return site_data.groupby(
+        ["Period_Start_Date", "Period_End_Date"], as_index=False
+    ).agg(agg_cols)
+
+
+# ─── Main analysis ────────────────────────────────────────────────────────────
+
+
+def _calc_meter_weights(site_data: pd.DataFrame, meter_nums: list) -> dict:
+    """
+    Calculate each meter's share of TOTAL BASELINE consumption at the site.
+    Returns {str(meter_num): fraction (0.0–1.0)}.
+    Meters with no baseline bills receive 0.0 (not excluded — just zero weight).
+    """
+    bl_df = site_data[site_data["Baseline_Bill"] == 1]
+
+    meter_bl_cons = {}
+    for meter in meter_nums:
+        m_bl = bl_df[bl_df["Meter_Number"] == meter]
+        meter_bl_cons[str(meter)] = float(m_bl["Consumption"].sum()) if len(m_bl) > 0 else 0.0
+
+    total = sum(meter_bl_cons.values())
+    if total == 0:
+        # All meters lack baseline bills — equal weights so output is still meaningful
+        n = max(len(meter_nums), 1)
+        return {str(m): 1.0 / n for m in meter_nums}
+
+    return {str(m): v / total for m, v in meter_bl_cons.items()}
+
+
+def _weight_source(meter_num, site_data: pd.DataFrame) -> str:
+    """Return a human-readable string describing the weight basis for this meter."""
+    m_df = site_data[site_data["Meter_Number"] == meter_num]
+    bl   = m_df[m_df["Baseline_Bill"] == 1]
+    if len(bl) > 0 and bl["Consumption"].sum() > 0:
+        return "Baseline consumption"
+    return "No baseline bills — weight is 0%"
+
+
+def _failing_weight_flag(meter_weights: dict, ind_results_for_site: list) -> tuple:
+    """
+    Assess the combined weight of FAILING individual meters.
+    Returns (flag: str, note: str).
+    No hard exclusions — purely informational.
+    """
+    failing = [
+        (str(meter_num), meter_weights.get(str(meter_num), 0.0))
+        for meter_num, res, _ in ind_results_for_site
+        if not res["passes_all"]
+    ]
+
+    if not failing:
+        return "OK", ""
+
+    failing_weight = sum(w for _, w in failing)
+    failing_names  = ", ".join(f"{m} ({w*100:.1f}%)" for m, w in failing)
+
+    if failing_weight > WEIGHT_HIGH_RISK_THRESHOLD:
+        note = (
+            f"HIGH RISK — failing meter(s) [{failing_names}] account for "
+            f"{failing_weight*100:.1f}% of site baseline load (>{WEIGHT_HIGH_RISK_THRESHOLD*100:.0f}% threshold). "
+            f"The aggregate model covers consumption that cannot be individually verified — "
+            f"review carefully before reporting."
+        )
+        return "HIGH RISK", note
+
+    if failing_weight > WEIGHT_REVIEW_THRESHOLD:
+        note = (
+            f"REVIEW — failing meter(s) [{failing_names}] account for "
+            f"{failing_weight*100:.1f}% of site baseline load (>{WEIGHT_REVIEW_THRESHOLD*100:.0f}% threshold). "
+            f"A meaningful portion of site load is from unverified meters — analyst review recommended."
+        )
+        return "REVIEW", note
+
+    return "OK", ""
+
+
+def _low_coverage_flag(weight: float, passes_quality: bool) -> str:
+    """
+    Flag individual passing meters that represent a small fraction of site load.
+    Only applied when the meter is part of a concurrent multi-meter site.
+    Fires only on passing meters; failing meters are addressed via aggregate notes.
+    """
+    if not passes_quality:
+        return ""   # failing meters: weight context lives in aggregate Notes column
+    if weight < LOW_COVERAGE_THRESHOLD:
+        return f"LOW COVERAGE ({weight*100:.1f}% of site baseline load)"
+    return ""
+
+
+def _build_meter_weight_rows(
+    site: str,
+    service_type: str,
+    meter_weights: dict,
+    ind_results_for_site: list,
+    site_data: pd.DataFrame,
+    agg_weight_flag: str,
+) -> list:
+    """One row per meter for the Meter Weights output table."""
+    rows = []
+    for meter_num, res, _ in ind_results_for_site:
+        m_key  = str(meter_num)
+        weight = meter_weights.get(m_key, 0.0)
+        m_df   = site_data[site_data["Meter_Number"] == meter_num]
+        bl_df  = m_df[m_df["Baseline_Bill"] == 1]
+        bl_cons = float(bl_df["Consumption"].sum()) if len(bl_df) > 0 else 0.0
+
+        rows.append({
+            "Site Name":               site,
+            "Meter Number":            m_key,
+            "Service Type":            service_type,
+            "Baseline Consumption":    round(bl_cons, 2),
+            "Meter Weight (%)":        round(weight * 100, 2),
+            "Weight Source":           _weight_source(meter_num, site_data),
+            "Individual Model Passes": res["passes_all"],
+            "Individual R2":           round(res["r2"], 4),
+            "Individual CV-RMSE":      round(res["cvrmse"], 2),
+            "Individual Pct Avoided":  round(res["pct_avoided"], 2),
+            "Coverage Flag":           _low_coverage_flag(weight, res["passes_all"]),
+            "Aggregate Weight Flag":   agg_weight_flag,
+        })
+    return rows
+
+
+
+
+# ── MAP / GEOCODING FEATURE (disabled) ──────────────────────────────────────
+# These functions (_load_zip_data, _geocode_sites) support geocoding site
+# addresses to lat/lng coordinates for use with a Sigma map element.
+# Disabled because Sigma's Snowflake Python sandbox blocks outbound HTTP.
+#
+# To re-enable:
+#   1. Un-comment this block
+#   2. Un-comment the _geocode_sites() call in run_analysis()
+#   3. Un-comment the address/coordinate columns in _build_result_row()
+#   4. Un-comment the _store_address() calls in run_analysis()
+#   5. Ask your Snowflake admin to create an External Access Integration
+#      for nominatim.openstreetmap.org
+#
+# def _load_zip_data() -> "pd.DataFrame | None":
+#     """
+#     Download US zip code → lat/lng lookup from the symerio GitHub mirror of
+#     GeoNames data. Tab-delimited, no API key required.
+#     Returns a DataFrame with columns [postal_code, latitude, longitude]
+#     or None if the download fails.
+#
+#     This runs inside Sigma's Python environment where outbound HTTP is available.
+#     The data is ~2MB uncompressed, parsed in ~0.3s, and held in memory for the
+#     duration of the Python session.
+#     """
+#     import urllib.request
+#     import io
+#
+#     URL = "https://symerio.github.io/postal-codes-data/data/geonames/US.txt"
+#     FIELDS = [
+#         "country_code", "postal_code", "place_name",
+#         "state_name", "state_code", "county_name", "county_code",
+#         "community_name", "community_code", "latitude", "longitude", "accuracy",
+#     ]
+#
+#     try:
+#         req = urllib.request.Request(URL, headers={"User-Agent": "MV-Engine/1.0"})
+#         with urllib.request.urlopen(req, timeout=20) as resp:
+#             raw = resp.read().decode("utf-8", errors="ignore")
+#
+#         zip_df = pd.read_csv(
+#             io.StringIO(raw),
+#             sep="	",
+#             header=None,
+#             names=FIELDS,
+#             dtype={"postal_code": str},
+#             usecols=["postal_code", "latitude", "longitude"],
+#         )
+#         zip_df["postal_code"] = zip_df["postal_code"].str.zfill(5).str.strip()
+#         return zip_df.drop_duplicates("postal_code").set_index("postal_code")
+#
+#     except Exception:
+#         return None
+#
+#
+# # Module-level cache so zip data is only downloaded once per Python session
+# _ZIP_DATA_CACHE = None
+#
+#
+# def _geocode_sites(df: pd.DataFrame) -> dict:
+#     """
+#     Geocode unique sites using a zip code → lat/lng lookup table sourced from
+#     GeoNames (via symerio GitHub mirror). No API key required.
+#
+#     Uses Zip Code column for fast, accurate centroid coordinates.
+#     Falls back to None if the zip is not found or the download fails.
+#
+#     Returns {site_name: (latitude, longitude)}.
+#     """
+#     global _ZIP_DATA_CACHE
+#
+#     # Find zip code column (space or underscore format)
+#     zip_col = next(
+#         (c for c in df.columns if "zip" in c.lower().replace("_", " ")),
+#         None
+#     )
+#     if zip_col is None:
+#         return {}   # no zip column — skip geocoding
+#
+#     # Load zip data on first call, cache for subsequent calls
+#     if _ZIP_DATA_CACHE is None:
+#         _ZIP_DATA_CACHE = _load_zip_data()
+#
+#     if _ZIP_DATA_CACHE is None:
+#         return {}   # download failed — skip geocoding silently
+#
+#     results = {}
+#     for site in df["Site_Name"].dropna().unique():
+#         row = df[df["Site_Name"] == site].iloc[0]
+#         raw_zip = str(row.get(zip_col, "")).strip()
+#         # Clean float-formatted zips (94587.0 → 94587)
+#         if raw_zip.endswith(".0"):
+#             raw_zip = raw_zip[:-2]
+#         zip5 = raw_zip.zfill(5)[:5]
+#
+#         if zip5 in _ZIP_DATA_CACHE.index:
+#             rec = _ZIP_DATA_CACHE.loc[zip5]
+#             results[site] = (float(rec["latitude"]), float(rec["longitude"]))
+#         else:
+#             results[site] = (None, None)
+#
+#     return results
+#
+#
+# ── END MAP / GEOCODING FEATURE ─────────────────────────────────────────────
+
+def run_analysis(df: pd.DataFrame):
+    """
+    Run full M&V analysis on the cleaned input DataFrame.
+    Returns a dict of DataFrames ready for Sigma table elements.
+    """
+    # ── Preprocessing ──────────────────────────────────────────────────────────
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+
+    # Keep original dataframe for input_with_baseline output
+    df_original = df.copy()
+
+    # Normalize column names: spaces → underscores internally.
+    # The template uses "Site Name" style; the engine works with "Site_Name" style.
+    # Both are supported — original names are preserved in output columns.
+    col_map = {c: c.replace(' ', '_') for c in df.columns}
+    df = df.rename(columns=col_map)
+
+    # Parse dates — strip timezone info (Sigma may inject UTC-aware datetimes)
+    for col in ["Period_Start_Date", "Period_End_Date", "Commission_Date"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True).dt.tz_localize(None)
+
+    # Numeric coercions — strip currency symbols/commas before converting
+    for col in ["HDD", "CDD", "Consumption"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Total_Charges may arrive as "$1,234.56" string from Sigma — clean it first
+    if "Total_Charges" in df.columns:
+        df["Total_Charges"] = (
+            df["Total_Charges"]
+            .astype(str)
+            .str.replace(r"[\$,]", "", regex=True)
+            .str.strip()
+        )
+        df["Total_Charges"] = pd.to_numeric(df["Total_Charges"], errors="coerce")
+
+    # Unit conversion (optional column)
+    df = _convert_units(df)
+
+    # ── Baseline selection lock ────────────────────────────────────────────────
+    # If "Selected Baseline" column is present and populated, the optimizer was
+    # already run. Skip optimization and use pre-selected bills directly.
+    # This ensures re-running the script (e.g. after adding reporting bills)
+    # never changes the baseline model or savings results.
+    # Normalise Selected_Baseline: convert float 1.0 / NaN (from CSV download) to "1" / ""
+    if "Selected_Baseline" in df.columns:
+        df["Selected_Baseline"] = (
+            df["Selected_Baseline"]
+            .apply(lambda v: "1" if str(v).strip() in ("1", "1.0") else "")
+        )
+    has_locked_baseline = (
+        "Selected_Baseline" in df.columns
+        and (df["Selected_Baseline"] == "1").any()
+    )
+
+    # Geocode sites using address columns if present (runs once, cached by site)
+    site_coords = {}   # MAP FEATURE (disabled) — un-comment _geocode_sites call to re-enable
+
+    # Baseline/Reporting flags
+    df = _infer_flags(df)
+
+    # ── Storage for outputs ────────────────────────────────────────────────────
+    individual_rows = []
+    aggregated_rows = []
+    baseline_bill_rows = []
+    reporting_bill_rows = []
+    outlier_rows = []
+    meter_weight_rows = []
+    selected_baseline_keys = set()  # (site, meter, period_start_date) of selected bills
+
+    for service_type in df["Service_Type"].dropna().unique():
+        is_gas      = _is_gas(service_type)
+        svc_df      = df[df["Service_Type"].str.lower().str.contains(
+            "gas" if is_gas else "elec", na=False
+        )].copy()
+        bl_count    = GAS_BASELINE_COUNT if is_gas else ELEC_BASELINE_COUNT
+        r2_thresh   = GAS_R2_THRESHOLD   if is_gas else ELEC_R2_THRESHOLD
+        display_svc = "Natural Gas" if is_gas else "Electricity"
+
+        for site in sorted(svc_df["Site_Name"].dropna().unique()):
+            site_data   = svc_df[svc_df["Site_Name"] == site].copy()
+            meter_nums  = [m for m in site_data["Meter_Number"].dropna().unique()]
+            meter_count = len(meter_nums)
+            concurrent  = _meters_concurrent(site_data) if meter_count > 1 else False
+
+            # ── Individual meter analysis ──────────────────────────────────────
+            ind_results_for_site = []
+
+            if meter_count == 0 or (meter_count == 1 and pd.isna(meter_nums[0])):
+                # No meter number — analyze by site
+                meter_iter = [("N/A", site_data)]
+            elif not concurrent and meter_count > 1:
+                # Sequential meters — combine into single timeline
+                combined = _aggregate_site(site_data)
+                meter_label = ", ".join(sorted(str(m) for m in meter_nums))
+                meter_iter = [(meter_label, combined)]
+            else:
+                meter_iter = [(m, site_data[site_data["Meter_Number"] == m]) for m in sorted(meter_nums, key=str)]
+
+            for meter_num, meter_data in meter_iter:
+                sequential = (not concurrent and meter_count > 1)
+
+                if has_locked_baseline:
+                    # ── LOCKED MODE: baseline already selected ─────────────────
+                    # Use the Selected_Baseline flag to identify which bills form
+                    # the baseline. Skip the optimizer entirely.
+                    res, bl_out, rep_out = _optimize_from_locked(
+                        f"{site}__{meter_num}", display_svc, meter_data, r2_thresh
+                    )
+                else:
+                    # ── OPTIMIZE MODE: find the best baseline combination ───────
+                    res, bl_out, rep_out = _optimize(
+                        f"{site}__{meter_num}", display_svc, meter_data, bl_count, r2_thresh
+                    )
+
+                if res is None:
+                    continue
+
+                # _store_address(res, site_data, site)  # MAP FEATURE (disabled)
+                row = _build_result_row(
+                    res, site, meter_num, "Individual", display_svc,
+                    bl_count, concurrent, sequential
+                )
+                individual_rows.append(row)
+                ind_results_for_site.append((meter_num, res, row))
+
+                # Bill detail rows
+                baseline_bill_rows += _build_baseline_rows(res, site, meter_num, display_svc)
+                for _, _sr in res["selected"].iterrows():
+                    # Normalise N/A, blank, nan all to "" so lookup matches
+                    _mn = str(meter_num) if str(meter_num) not in ("", "nan", "N/A", "n/a") and pd.notna(meter_num) else ""
+                    selected_baseline_keys.add((str(site), _mn,
+                        str(pd.to_datetime(_sr["Period_Start_Date"]).date())))
+                reporting_bill_rows += _build_reporting_rows(res, site, meter_num, display_svc)
+
+                # Outliers
+                for o in bl_out:
+                    outlier_rows.append({
+                        "Site Name":      site,
+                        "Meter Number":   str(meter_num),
+                        "Service Type":   display_svc,
+                        "Period Start Date": o.get("Period_Start_Date") or o.get("Period Start Date"),
+                        "Period End Date":   o.get("Period_End_Date")   or o.get("Period End Date"),
+                        "HDD":            o.get("HDD"),
+                        "CDD":            o.get("CDD"),
+                        "Consumption":    o.get("Consumption"),
+                        "Total Charges":  o.get("Total_Charges") or o.get("Total Charges"),
+                        "Outlier Type":   o.get("Outlier_Type",   o.get("Outlier Type", "")),
+                        "Outlier Reason": o.get("Outlier_Reason", o.get("Outlier Reason", "")),
+                    })
+                for o in rep_out:
+                    outlier_rows.append({
+                        "Site Name":      site,
+                        "Meter Number":   str(meter_num),
+                        "Service Type":   display_svc,
+                        "Period Start Date": o.get("Period_Start_Date") or o.get("Period Start Date"),
+                        "Period End Date":   o.get("Period_End_Date")   or o.get("Period End Date"),
+                        "HDD":            o.get("HDD"),
+                        "CDD":            o.get("CDD"),
+                        "Consumption":    o.get("Consumption"),
+                        "Total Charges":  o.get("Total_Charges") or o.get("Total Charges"),
+                        "Outlier Type":   o.get("Outlier_Type",   o.get("Outlier Type", "")),
+                        "Outlier Reason": o.get("Outlier_Reason", o.get("Outlier Reason", "")),
+                    })
+
+            # ── Meter weighting (concurrent multi-meter sites only) ───────────
+            if concurrent and meter_count > 1 and len(ind_results_for_site) > 0:
+                mw = _calc_meter_weights(site_data, [m for m, _, _ in ind_results_for_site])
+                # Stamp Meter Weight (%) and Coverage Flag onto each individual row
+                for r in individual_rows:
+                    if (r["Site Name"] == site
+                            and r["Service Type"] == display_svc
+                            and r["Model Type"] == "Individual"):
+                        m_key = str(r["Meter Number"])
+                        w = mw.get(m_key, 0.0)
+                        r["Meter Weight (%)"] = round(w * 100, 2)
+                        r["Coverage Flag"]    = _low_coverage_flag(w, r["Model Passes Quality"])
+            else:
+                mw = {}
+
+            # ── Aggregated analysis (concurrent multi-meter sites only) ────────
+            if concurrent and meter_count > 1:
+                agg_data = _aggregate_site(site_data)
+                res, bl_out, rep_out = _optimize(
+                    f"{site}__AGGREGATED", display_svc, agg_data, bl_count, r2_thresh
+                )
+                if res is not None:
+                    # _store_address(res, site_data, site)  # MAP FEATURE (disabled)
+                    row = _build_result_row(
+                        res, site, f"AGGREGATED ({meter_count})", "Aggregated",
+                        display_svc, bl_count, concurrent, False
+                    )
+                    # Attach Notes comparing individual vs. aggregated
+                    # Assess failing-meter weight and build combined Notes
+                    agg_flag, weight_note = _failing_weight_flag(mw, ind_results_for_site)
+                    row["Weight Flag"]  = agg_flag
+                    quality_note        = _build_notes(ind_results_for_site, res, meter_count)
+                    row["Notes"]        = " | ".join(filter(None, [quality_note, weight_note]))
+
+                    # Patch individual rows with same Notes
+                    for r in individual_rows:
+                        if (r["Site Name"] == site
+                                and r["Service Type"] == display_svc
+                                and r["Model Type"] == "Individual"):
+                            r["Notes"] = row["Notes"]
+
+                    # Build Meter Weights table rows
+                    meter_weight_rows.extend(
+                        _build_meter_weight_rows(
+                            site, display_svc, mw,
+                            ind_results_for_site, site_data, agg_flag
+                        )
+                    )
+
+                    aggregated_rows.append(row)
+                    baseline_bill_rows  += _build_baseline_rows(res, site, f"AGGREGATED ({meter_count})", display_svc)
+                    for _, _sr in res["selected"].iterrows():
+                        selected_baseline_keys.add((str(site), "AGGREGATED",
+                            str(pd.to_datetime(_sr["Period_Start_Date"]).date())))
+                    reporting_bill_rows += _build_reporting_rows(res, site, f"AGGREGATED ({meter_count})", display_svc)
+                    for o in bl_out:
+                        outlier_rows.append({
+                            "Site Name":      site,
+                            "Meter Number":   f"AGGREGATED ({meter_count})",
+                            "Service Type":   display_svc,
+                            "Period Start Date": o.get("Period_Start_Date") or o.get("Period Start Date"),
+                            "Period End Date":   o.get("Period_End_Date")   or o.get("Period End Date"),
+                            "HDD":            o.get("HDD"),
+                            "CDD":            o.get("CDD"),
+                            "Consumption":    o.get("Consumption"),
+                            "Total Charges":  o.get("Total_Charges") or o.get("Total Charges"),
+                            "Outlier Type":   o.get("Outlier_Type",   o.get("Outlier Type", "")),
+                            "Outlier Reason": o.get("Outlier_Reason", o.get("Outlier Reason", "")),
+                        })
+                    for o in rep_out:
+                        outlier_rows.append({
+                            "Site Name":      site,
+                            "Meter Number":   f"AGGREGATED ({meter_count})",
+                            "Service Type":   display_svc,
+                            "Period Start Date": o.get("Period_Start_Date") or o.get("Period Start Date"),
+                            "Period End Date":   o.get("Period_End_Date")   or o.get("Period End Date"),
+                            "HDD":            o.get("HDD"),
+                            "CDD":            o.get("CDD"),
+                            "Consumption":    o.get("Consumption"),
+                            "Total Charges":  o.get("Total_Charges") or o.get("Total Charges"),
+                            "Outlier Type":   o.get("Outlier_Type",   o.get("Outlier Type", "")),
+                            "Outlier Reason": o.get("Outlier_Reason", o.get("Outlier Reason", "")),
+                        })
+                else:
+                    # Aggregated model failed to optimise (insufficient clean bills etc.)
+                    # Still record meter weights so analyst can see the load distribution
+                    if mw:
+                        meter_weight_rows.extend(
+                            _build_meter_weight_rows(
+                                site, display_svc, mw,
+                                ind_results_for_site, site_data, "NO AGG MODEL"
+                            )
+                        )
+
+    # ── Assemble output DataFrames ─────────────────────────────────────────────
+    # Schema definitions — ensures every output has columns even when empty.
+    # Snowpark/Sigma cannot output a DataFrame with no columns (raises schema error).
+    SCHEMAS = {
+        "individual":  ["Site Name","Meter Number","Model Type","Service Type",
+                        "Seasonal Strategy","Optimization Mode","Baseline Count","Reporting Count",
+                        "Model Equation","Intercept","HDD Coefficient","CDD Coefficient",
+                        "R2","R2 Rating","Passes R2","CV-RMSE","CV-RMSE Rating",
+                        "Passes CV-RMSE","Weather Coverage (%)","HDD Coverage (%)",
+                        "CDD Coverage (%)","Weather Coverage Rating","Passes Weather Coverage",
+                        "Model Passes Quality","Q1 Bills","Q2 Bills","Q3 Bills","Q4 Bills",
+                        "Temporal CV","Total Avoided Usage","Pct Avoided Usage","Notes",
+                        "Weight Flag","Meter Weight (%)","Coverage Flag",
+                        "Measured Rate","Modeled Cost ($)","Actual Cost ($)",
+                        "Avoided Cost ($)","Avg Monthly Avoided Cost",
+                        "Total Modeled Usage","Total Actual Usage",
+                        "Savings Exclusion Flag","Savings Status",
+                        "New Site","CV Ceiling Relaxed"],
+                        # MAP FEATURE columns (disabled — un-comment to re-enable):
+                        # "Street Address","City","State","Zip Code",
+                        # "Full Address","Latitude","Longitude"
+        "aggregated":  ["Site Name","Meter Number","Model Type","Service Type",
+                        "Seasonal Strategy","Optimization Mode","Baseline Count","Reporting Count",
+                        "Model Equation","Intercept","HDD Coefficient","CDD Coefficient",
+                        "R2","R2 Rating","Passes R2","CV-RMSE","CV-RMSE Rating",
+                        "Passes CV-RMSE","Weather Coverage (%)","HDD Coverage (%)",
+                        "CDD Coverage (%)","Weather Coverage Rating","Passes Weather Coverage",
+                        "Model Passes Quality","Q1 Bills","Q2 Bills","Q3 Bills","Q4 Bills",
+                        "Temporal CV","Total Avoided Usage","Pct Avoided Usage","Notes",
+                        "Weight Flag","Meter Weight (%)","Coverage Flag",
+                        "Measured Rate","Modeled Cost ($)","Actual Cost ($)",
+                        "Avoided Cost ($)","Avg Monthly Avoided Cost",
+                        "Total Modeled Usage","Total Actual Usage",
+                        "Savings Exclusion Flag","Savings Status",
+                        "New Site","CV Ceiling Relaxed"],
+                        # MAP FEATURE columns (disabled — un-comment to re-enable):
+                        # "Street Address","City","State","Zip Code",
+                        # "Full Address","Latitude","Longitude"
+        "bills":       ["Site Name","Meter Number","Service Type","Period Type","Status",
+                        "Period Start Date","Period End Date","HDD","CDD",
+                        "Consumption","Total Charges","Predicted Consumption",
+                        "Avoided Usage","Pct Avoided","Bill Avoided Cost",
+                        "Selected Baseline"],
+        "outliers":    ["Site Name","Meter Number","Service Type",
+                        "Period Start Date","Period End Date","HDD","CDD",
+                        "Consumption","Total Charges",
+                        "Outlier Type","Outlier Reason"],
+        "weights":     ["Site Name","Meter Number","Service Type",
+                        "Baseline Consumption","Meter Weight (%)","Weight Source",
+                        "Individual Model Passes","Individual R2","Individual CV-RMSE",
+                        "Individual Pct Avoided","Coverage Flag","Aggregate Weight Flag"],
+    }
+
+    def safe_df(rows, schema_key):
+        if rows:
+            df_out = pd.DataFrame(rows)
+        else:
+            # Return empty DataFrame with correct columns so Snowpark can infer schema
+            df_out = pd.DataFrame(columns=SCHEMAS[schema_key])
+        # Hard-enforce schema for outliers: strip any extra columns that leaked
+        # through from the input DataFrame (e.g. duplicate Site Name (1) etc.)
+        if schema_key == "outliers" and len(df_out.columns) > 0:
+            keep = [c for c in SCHEMAS["outliers"] if c in df_out.columns]
+            if keep:
+                df_out = df_out[keep]
+        return df_out
+
+    ind_df  = safe_df(individual_rows,   "individual")
+    agg_df  = safe_df(aggregated_rows,   "aggregated")
+    bl_df   = safe_df(baseline_bill_rows, "bills")
+    rep_df  = safe_df(reporting_bill_rows,"bills")
+    out_df  = safe_df(outlier_rows,       "outliers")
+    mw_df   = safe_df(meter_weight_rows,  "weights")
+
+    # ── input_with_baseline: original input + Selected Baseline column ────────
+    iwb_df = df_original.copy()
+    # Drop any existing Selected Baseline column (could be "Selected Baseline"
+    # or "Selected_Baseline" depending on prior normalisation) so we always
+    # output exactly one clean copy at the end.
+    iwb_df = iwb_df.drop(columns=[
+        c for c in iwb_df.columns
+        if c.lower().replace(" ", "_") == "selected_baseline"
+    ])
+    iwb_df["Selected Baseline"] = ""
+    _sc = next((c for c in iwb_df.columns if c.lower().replace("_"," ")=="site name"), None)
+    _mc = next((c for c in iwb_df.columns if "meter" in c.lower()), None)
+    _pc = next((c for c in iwb_df.columns if "start" in c.lower()), None)
+    if _sc and _pc:
+        # For locked baselines: the normalised df already has Selected_Baseline="1"
+        # on the chosen bills. Map those back onto df_original via site+meter+date key.
+        # This is more reliable than selected_baseline_keys which depends on
+        # _optimize_from_locked having recorded keys correctly.
+        if has_locked_baseline and "Selected_Baseline" in df.columns:
+            # Build a lookup from the internal (normalised) df
+            _sel_col = "Selected_Baseline"
+            _mc_int  = next((c for c in df.columns if "meter" in c.lower()), None)
+            _pc_int  = next((c for c in df.columns if "start" in c.lower()), None)
+            _sc_int  = next((c for c in df.columns if c.lower() == "site_name"), None)
+            if _sc_int and _pc_int:
+                locked_keys = set()
+                for _, _lr in df[df[_sel_col] == "1"].iterrows():
+                    _ls  = str(_lr.get(_sc_int,""))
+                    _lm  = str(_lr.get(_mc_int,"")) if _mc_int else ""
+                    _lm  = "" if _lm.strip() in ("","nan","N/A") else _lm
+                    _lpd = str(pd.to_datetime(_lr.get(_pc_int,""),errors="coerce").date())
+                    locked_keys.add((_ls, _lm, _lpd))
+                def _mark(r):
+                    sv = str(r.get(_sc,""))
+                    _raw_mv = r.get(_mc,"") if _mc else ""
+                    mv = "" if (pd.isna(_raw_mv) or str(_raw_mv).strip() in ("","nan")) else str(_raw_mv)
+                    pv = str(pd.to_datetime(r.get(_pc,""),errors="coerce").date())
+                    if (sv,mv,pv) in locked_keys: return "1"
+                    if (sv,"AGGREGATED",pv) in locked_keys: return "1"
+                    return ""
+            else:
+                def _mark(r): return ""
+        else:
+            def _mark(r):
+                sv = str(r.get(_sc,""))
+                _raw_mv = r.get(_mc,"") if _mc else ""
+                mv = "" if (pd.isna(_raw_mv) or str(_raw_mv).strip() in ("","nan")) else str(_raw_mv)
+                pv = str(pd.to_datetime(r.get(_pc,""),errors="coerce").date())
+                if (sv,mv,pv) in selected_baseline_keys: return "1"
+                if (sv,"AGGREGATED",pv) in selected_baseline_keys: return "1"
+                return ""
+        iwb_df["Selected Baseline"] = iwb_df.apply(_mark, axis=1)
+    _oc = [c for c in df_original.columns if c != "Selected Baseline"]
+    iwb_df = iwb_df[_oc + ["Selected Baseline"]]
+    # Ensure Selected Baseline is always clean string "1" or "" (never NaN or 1.0)
+    iwb_df["Selected Baseline"] = iwb_df["Selected Baseline"].apply(
+        lambda v: "1" if str(v).strip() in ("1", "1.0") else ""
+    )
+
+    # Add cost analysis columns to model result tables
+    if len(ind_df) > 0:
+        ind_df = _add_cost_columns(ind_df)
+    if len(agg_df) > 0:
+        agg_df = _add_cost_columns(agg_df)
+
+    # Stamp geocoded coordinates onto model result rows
+    if site_coords:
+        for df_out in [ind_df, agg_df]:
+            if len(df_out) > 0 and 'Site Name' in df_out.columns:
+                df_out['Latitude']  = df_out['Site Name'].map(
+                    lambda s: site_coords.get(s, (None, None))[0])
+                df_out['Longitude'] = df_out['Site Name'].map(
+                    lambda s: site_coords.get(s, (None, None))[1])
+
+    return {
+        "individual_models":      ind_df,
+        "aggregated_models":      agg_df,
+        "baseline_bills":         bl_df,
+        "reporting_bills":        rep_df,
+        "outliers":               out_df,
+        "meter_weights":          mw_df,
+        "input_with_baseline":    iwb_df,
+    }
+
+
+# ─── Row builders ─────────────────────────────────────────────────────────────
+
+# ── MAP FEATURE — address helper functions (disabled) ──────────────────────
+# def _store_address(res: dict, site_data: "pd.DataFrame", site: str):
+#     """
+#     Look up address columns in site_data for the given site and store
+#     them on the result dict so _build_result_row can pass them through.
+#     Works with either space-format or underscore-format column names.
+#     """
+#     row = site_data[site_data["Site_Name"] == site].iloc[0] if len(site_data) > 0 else None
+#     if row is None:
+#         return
+#
+#     def _find(keywords):
+#         for col in site_data.columns:
+#             c = col.lower().replace("_", " ")
+#             if any(k in c for k in keywords):
+#                 val = row.get(col)
+#                 if pd.notna(val):
+#                     # Clean zip codes read as float
+#                     s = str(val).strip()
+#                     return s[:-2] if s.endswith(".0") else s
+#         return None
+#
+#     res["_addr_street"] = _find(["street address", "street"])
+#     res["_addr_city"]   = _find(["city"])
+#     res["_addr_state"]  = _find(["state"])
+#     res["_addr_zip"]    = _find(["zip"])
+#
+#
+# def _get_site_address(res: dict, field: str):
+#     """Pull an address field from the result dict if it was stored there."""
+#     return res.get(f"_addr_{field}")
+#
+#
+# ── END MAP FEATURE (address helpers) ──────────────────────────────────────
+
+def _compute_cost_cols(res: dict) -> dict:
+    """
+    Compute cost columns from the optimised result while the model and
+    clean_reporting DataFrame are still directly available.
+    Returns a dict of cost columns ready to merge into the result row.
+    """
+    rep_df = res.get("clean_reporting")
+    model  = res.get("model")
+
+    empty = {
+        "Measured Rate":          None,
+        "Modeled Cost ($)":       None,
+        "Actual Cost ($)":        None,
+        "Avoided Cost ($)":       None,
+        "Avg Monthly Avoided Cost": None,
+        "Total Modeled Usage":    None,
+        "Total Actual Usage":     None,
+        "Savings Exclusion Flag": "",
+    }
+    zeroed = {
+        "Measured Rate":          None,
+        "Modeled Cost ($)":       None,
+        "Actual Cost ($)":        None,
+        "Avoided Cost ($)":       0.0,
+        "Avg Monthly Avoided Cost": 0.0,
+        "Total Modeled Usage":    None,
+        "Total Actual Usage":     None,
+    }
+
+    if model is None or rep_df is None or len(rep_df) == 0:
+        # No clean reporting bills — all were excluded as outliers or none exist
+        if rep_df is not None and hasattr(rep_df, "__len__") and len(rep_df) == 0:
+            flag = "EXCLUDED — All reporting bills removed as outliers"
+        else:
+            flag = ""
+        return {**empty,
+                "Savings Status": "Excluded — All Reporting Bills Removed" if flag else "Included",
+                "Savings Exclusion Flag": flag}
+
+    # Total Charges column may be underscore-normalised internally
+    charge_col = "Total_Charges" if "Total_Charges" in rep_df.columns else "Total Charges"
+    if charge_col not in rep_df.columns:
+        return empty
+
+    total_charges = float(rep_df[charge_col].sum())
+    total_cons    = float(rep_df["Consumption"].sum())
+    if total_cons == 0:
+        return empty
+
+    rate = total_charges / total_cons
+    is_gas = _is_gas(res.get("service_type_internal", ""))
+    X = rep_df[["HDD"]].values if is_gas else rep_df[["HDD", "CDD"]].values
+    pred_sum = float(model.predict(X).sum())
+    n_bills  = len(rep_df)
+
+    avoided_cost = round(pred_sum * rate - total_charges, 2)
+
+    # Check if ALL clean reporting bills show negative savings
+    # Uses the actual per-bill avoided consumption (pred - actual per bill)
+    is_gas_flag = _is_gas(res.get("service_type_internal", ""))
+    X_check = rep_df[["HDD"]].values if is_gas_flag else rep_df[["HDD", "CDD"]].values
+    per_bill_pred = model.predict(X_check)
+    per_bill_pct  = (per_bill_pred - rep_df["Consumption"].values) / per_bill_pred
+    all_negative  = bool((per_bill_pct < 0).all())
+
+    if all_negative:
+        return {
+            **zeroed,
+            "Savings Status":         "Excluded — All Reporting Periods Negative",
+            "Savings Exclusion Flag": (
+                f"EXCLUDED — All {n_bills} clean reporting bill(s) show negative savings "
+                f"(avg {per_bill_pct.mean()*100:.1f}% avoided)"
+            ),
+        }
+
+    return {
+        "Measured Rate":            round(rate, 4),
+        "Modeled Cost ($)":         round(pred_sum * rate, 2),
+        "Actual Cost ($)":          round(total_charges, 2),
+        "Avoided Cost ($)":         avoided_cost,
+        "Avg Monthly Avoided Cost": round(avoided_cost / n_bills, 2) if n_bills else None,
+        "Total Modeled Usage":      round(pred_sum, 2),
+        "Total Actual Usage":       round(total_cons, 2),
+        "Savings Status":           "Included",
+        "Savings Exclusion Flag":   "",
+    }
+
+
+def _build_result_row(res, site, meter_num, model_type, service_type,
+                      bl_count, concurrent, sequential):
+    # Store service_type on res so _compute_cost_cols can check is_gas
+    res["service_type_internal"] = service_type
+
+    r2_rating = (
+        "Excellent" if res["r2"] >= 0.9 else
+        "Good"      if res["r2"] >= 0.75 else
+        "Fair"      if res["r2"] >= 0.6  else "Poor"
+    )
+    cv_rating = (
+        "Excellent"          if res["cvrmse"] < 10  else
+        "Good (ASHRAE Pass)" if res["cvrmse"] <= 15 else
+        "Fair (Fail)"        if res["cvrmse"] <= 25 else "Poor"
+    )
+    wc_rating = (
+        "Excellent" if res["wc_overall"] >= 90 else
+        "Good"      if res["wc_overall"] >= 75 else
+        "Fair"      if res["wc_overall"] >= 60 else "Poor"
+    )
+
+    notes = ""
+    if sequential:
+        n = str(meter_num).count(",") + 2 if "," in str(meter_num) else 2
+        notes = f"Sequential meter replacement: meters combined into single timeline"
+
+    return {
+        "Site Name":               site,
+        "Meter Number":            str(meter_num),
+        "Model Type":              model_type,
+        "Service Type":            service_type,
+        "Seasonal Strategy":       res["seasonal_strategy"],
+        "Optimization Mode":       "Locked" if res["seasonal_strategy"] == "Locked (pre-selected)" else "Optimized",
+        "New Site":                res.get("is_new_site", False),
+        "CV Ceiling Relaxed":      res.get("cv_ceiling_relaxed", False),
+        "Baseline Count":          len(res["selected"]),
+        "Reporting Count":         res["reporting_count"],
+        "Model Equation":          res["equation"],
+        "Intercept":               round(res["intercept"], 4),
+        "HDD Coefficient":         round(res["hdd_coef"], 4),
+        "CDD Coefficient":         round(res["cdd_coef"], 4),
+        "R2":                      round(res["r2"], 4),
+        "R2 Rating":               r2_rating,
+        "Passes R2":               res["passes_r2"],
+        "CV-RMSE":                 round(res["cvrmse"], 2),
+        "CV-RMSE Rating":          cv_rating,
+        "Passes CV-RMSE":          res["passes_cvrmse"],
+        "Weather Coverage (%)":    round(res["wc_overall"], 1),
+        "HDD Coverage (%)":        round(res["wc_hdd"], 1),
+        "CDD Coverage (%)":        round(res["wc_cdd"], 1),
+        "Weather Coverage Rating": wc_rating,
+        "Passes Weather Coverage": res["passes_wc"],
+        "Model Passes Quality":    res["passes_all"],
+        "Q1 Bills":                res["Q1_Bills"],
+        "Q2 Bills":                res["Q2_Bills"],
+        "Q3 Bills":                res["Q3_Bills"],
+        "Q4 Bills":                res["Q4_Bills"],
+        "Temporal CV":             round(res["temporal_cv"], 1),
+        "Total Avoided Usage":     round(res["total_avoided"], 2),
+        "Pct Avoided Usage":       round(res["pct_avoided"], 2),
+        "Notes":                   notes,
+        "Savings Status":          "Included",  # overwritten to "Excluded" by _compute_cost_cols
+        "Weight Flag":             "",     # filled in for aggregate rows
+        "Meter Weight (%)":        None,   # filled in for concurrent multi-meter sites
+        "Coverage Flag":           "",     # LOW COVERAGE if passing meter < 15% of site load
+        # ── MAP FEATURE (disabled) — address and coordinate output columns ────
+        # Un-comment to re-enable alongside the geocoding block.
+        # "Street Address":  _get_site_address(res, "street"),
+        # "City":            _get_site_address(res, "city"),
+        # "State":           _get_site_address(res, "state"),
+        # "Zip Code":        _get_site_address(res, "zip"),
+        # "Full Address":    ", ".join(filter(None, [
+        #                        _get_site_address(res, "street"),
+        #                        _get_site_address(res, "city"),
+        #                        _get_site_address(res, "state"),
+        #                        _get_site_address(res, "zip"),
+        #                    ])) or None,
+        # "Latitude":        None,
+        # "Longitude":       None,
+        # ── END MAP FEATURE (address columns) ────────────────────────────────
+        # Cost columns — computed here while model/rep_df are in scope
+        **_compute_cost_cols(res),
+    }
+
+
+def _build_baseline_rows(res, site, meter_num, service_type):
+    rows = []
+    used_dates = set(res["selected"]["Period_Start_Date"])
+    # All clean baseline bills (used + not selected)
+    for _, r in res["selected"].iterrows():
+        row = _bill_row(r, site, meter_num, service_type, "Baseline", "Used in Model")
+        row["Selected Baseline"] = "1"   # marks this bill for lock-based re-runs
+        rows.append(row)
+    if "reporting_all" in res:
+        # Not-selected bills: those in the full clean baseline but not selected
+        # We don't store the full pool in res by default — mark selected only
+        pass
+    # Outliers
+    if len(res.get("bl_outliers_df", pd.DataFrame())) > 0:
+        for _, r in res["bl_outliers_df"].iterrows():
+            rows.append(_bill_row(r, site, meter_num, service_type, "Baseline",
+                                  f"Excluded: {r.get('Outlier_Reason','Outlier')}"))
+    return rows
+
+
+def _build_reporting_rows(res, site, meter_num, service_type):
+    rows = []
+    model  = res["model"]
+    is_gas = _is_gas(service_type)
+    if len(res["clean_reporting"]) > 0:
+        X = res["clean_reporting"][["HDD"]].values if is_gas else res["clean_reporting"][["HDD", "CDD"]].values
+        pred = model.predict(X)
+        for i, (_, r) in enumerate(res["clean_reporting"].iterrows()):
+            row = _bill_row(r, site, meter_num, service_type, "Reporting", "Used in Savings")
+            row["Predicted Consumption"] = round(float(pred[i]), 2)
+            row["Avoided Usage"]         = round(float(pred[i]) - float(r["Consumption"]), 2)
+            row["Pct Avoided"]           = round((float(pred[i]) - float(r["Consumption"])) / float(pred[i]) * 100, 2) if pred[i] != 0 else 0.0
+            rows.append(row)
+            _cons = float(r["Consumption"])
+            _charges = float(r.get("Total_Charges", r.get("Total Charges", 0)))
+            _rate = (_charges / _cons) if _cons > 0 else 0.0
+            row["Bill Avoided Cost"] = round((float(pred[i]) - _cons) * _rate, 2)
+    if len(res["rep_outliers"]) > 0:
+        X_o  = res["rep_outliers"][["HDD"]].values if is_gas else res["rep_outliers"][["HDD","CDD"]].values
+        pred_o = model.predict(X_o)
+        for i, (_, r) in enumerate(res["rep_outliers"].iterrows()):
+            row = _bill_row(r, site, meter_num, service_type, "Reporting",
+                            f"Excluded: {r.get('Outlier_Reason','Outlier')}")
+            row["Predicted Consumption"] = round(float(pred_o[i]), 2)
+            row["Avoided Usage"]         = round(float(pred_o[i]) - float(r["Consumption"]), 2)
+            row["Pct Avoided"]           = round((float(pred_o[i]) - float(r["Consumption"])) / float(pred_o[i]) * 100, 2) if pred_o[i] != 0 else 0.0
+            rows.append(row)
+            _cons_o = float(r["Consumption"])
+            _charges_o = float(r.get("Total_Charges", r.get("Total Charges", 0)))
+            _rate_o = (_charges_o / _cons_o) if _cons_o > 0 else 0.0
+            row["Bill Avoided Cost"] = round((float(pred_o[i]) - _cons_o) * _rate_o, 2)
+    return rows
+
+
+def _bill_row(r, site, meter_num, service_type, period_type, status):
+    return {
+        "Site Name":              site,
+        "Meter Number":           str(meter_num),
+        "Service Type":           service_type,
+        "Period Type":            period_type,
+        "Status":                 status,
+        "Period Start Date":      r.get("Period_Start_Date"),
+        "Period End Date":        r.get("Period_End_Date"),
+        "HDD":                    r.get("HDD"),
+        "CDD":                    r.get("CDD"),
+        "Consumption":            r.get("Consumption"),
+        "Total Charges":          r.get("Total_Charges"),
+        "Predicted Consumption":  None,
+        "Avoided Usage":          None,
+        "Pct Avoided":            None,
+        "Bill Avoided Cost":      None,
+        "Selected Baseline":      None,   # "1" for bills used in model, blank otherwise
+    }
+
+
+def _add_cost_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Cost columns are now computed in _build_result_row. This is a no-op passthrough."""
+    return df.drop(columns=[c for c in ['_model', '_clean_reporting', '_selected_baseline']
+                             if c in df.columns])
+
+
+def _build_notes(ind_results, agg_res, meter_count):
+    ind_pass  = sum(1 for _, r, _ in ind_results if r["passes_all"])
+    total_ind = len(ind_results)
+    agg_pass  = agg_res["passes_all"]
+    avg_r2    = np.mean([r["r2"] for _, r, _ in ind_results]) if ind_results else 0
+    avg_sav   = np.mean([r["pct_avoided"] for _, r, _ in ind_results if r["passes_all"]]) if ind_pass > 0 else 0
+
+    if ind_pass == total_ind and agg_pass:
+        qual = f"All {total_ind} individual meters and aggregated pass quality"
+    elif ind_pass > 0 and agg_pass:
+        qual = f"{ind_pass}/{total_ind} individual meters and aggregated pass quality"
+    elif agg_pass and ind_pass == 0:
+        qual = f"Only aggregated passes quality (all {total_ind} individual meters fail)"
+    elif ind_pass == total_ind and not agg_pass:
+        qual = f"All {total_ind} individual meters pass; aggregated fails"
+    else:
+        qual = f"{ind_pass}/{total_ind} individual meters pass; aggregated {'passes' if agg_pass else 'fails'}"
+
+    parts = [
+        qual,
+        f"Avg individual R²={avg_r2:.2f}, Aggregated R²={agg_res['r2']:.2f}",
+    ]
+    if agg_pass and ind_pass > 0:
+        parts.append(f"Avg individual savings={avg_sav:.1f}%, Aggregated={agg_res['pct_avoided']:.1f}%")
+    return " | ".join(parts)
+
+
+# ─── Sigma entry point ────────────────────────────────────────────────────────
+#
+# HOW TO USE IN SIGMA
+# -------------------
+# 1. Change 'YOUR INPUT TABLE NAME' below to match the exact title of your CSV
+#    Input Table element in the workbook.
+#
+# 2. After running, the outputs appear as named nodes at the bottom of the Python
+#    element. Click each one and select "Table" to create child table elements:
+#
+#      individual_models    → Individual Models table (primary results)
+#      aggregated_models    → Aggregated Models table (multi-meter sites)
+#      baseline_bills       → Baseline Bill Detail table
+#      reporting_bills      → Reporting Bill Detail table
+#      outliers             → Outlier Detail table
+#      meter_weights        → Meter Weights table
+#      input_with_baseline  → Re-upload file: your original input + Selected Baseline column
+#
+# 3. You only need ONE Python element — sigma.output() handles all seven tables.
+#
+# RE-UPLOAD WORKFLOW (to add new reporting bills without re-running optimization):
+#   a. After the first run, download the input_with_baseline table as CSV
+#   b. Append new reporting bill rows to the bottom (leave Selected Baseline blank)
+#   c. Re-upload that CSV as your input and run — the optimizer will be skipped
+#      automatically because Selected Baseline is already populated
+#
+# NOTE: The element name is case-sensitive and must match exactly.
+
+# ↓↓ CHANGE THIS to the exact title of your CSV Input Table element ↓↓
+_raw = sigma.get_element('YOUR INPUT TABLE NAME')
+_raw = _raw.to_pandas(block=False)
+input_df = _raw.result()
+
+# Run the full M&V analysis
+results = run_analysis(input_df)
+
+# Output all seven tables — each becomes a child element in Sigma
+sigma.output('individual_models',   results['individual_models'])
+sigma.output('aggregated_models',   results['aggregated_models'])
+sigma.output('baseline_bills',      results['baseline_bills'])
+sigma.output('reporting_bills',     results['reporting_bills'])
+sigma.output('outliers',            results['outliers'])
+sigma.output('meter_weights',       results['meter_weights'])
+sigma.output('input_with_baseline', results['input_with_baseline'])
