@@ -14,8 +14,20 @@ SIGMA INPUTS
   'Input' — billing data (required); element name set by SIGMA_INPUT_ELEMENT
 
 OUTPUT TABLES
-  individual_models, aggregated_models, baseline_bills, reporting_bills,
+  all_models, aggregated_models, baseline_bills, reporting_bills,
   outliers, meter_weights, input_with_baseline
+
+  all_models         — every model row: one per individual meter, PLUS one per
+                       site/fuel aggregate. Filter on the "Model Type" column
+                       ("Individual" / "Aggregated") to separate them.
+                       Renamed from "individual_models", which stopped being
+                       accurate once aggregates were listed here too.
+  aggregated_models  — the "Model Type" == "Aggregated" rows only, as a
+                       convenience view. Every aggregate appears in BOTH
+                       tables, fit or not, so neither table hides anything.
+                       NOTE this makes aggregated_models a strict subset of
+                       all_models: anything that UNIONs the two will
+                       double-count every aggregate.
 
 INPUT COLUMNS
   Required : Site Name, Service Type, Period Start Date, Period End Date,
@@ -45,8 +57,11 @@ CVRMSE_THRESHOLD           = sigma.get_control_value('cvrmse-thresh')
 WEATHER_COVERAGE_THRESHOLD = sigma.get_control_value('weather-coverage-thresh')
 ELEC_BASELINE_COUNT        = sigma.get_control_value('electric-baseline-count')
 GAS_BASELINE_COUNT         = sigma.get_control_value('gas-baseline-count')
+# The only bills-per-quarter dial. The old 'abs-min-per-quarter' floor was
+# removed: with the electric balance threshold at 0.65 (which implies min >= 2 on
+# a 12-bill baseline) a floor of 1 could never bind, so the "Acceptable" rung it
+# fed was a no-op that produced nothing "Optimal" hadn't already found.
 PREFERRED_MIN_PER_QUARTER  = sigma.get_control_value('pref-min-per-quarter')
-MINIMUM_MIN_PER_QUARTER    = sigma.get_control_value('abs-min-per-quarter')
 OVERLAP_THRESHOLD          = sigma.get_control_value('overlap-thresh')
 TEMPORAL_CV_CEILING        = sigma.get_control_value('temporal-cv-ceiling')
 # Minimum ratio of any quarter's bill count to the mean quarter count.
@@ -69,6 +84,13 @@ EXHAUSTIVE_LIMIT           = sigma.get_control_value('exhaustive-limit')
 # Above this, random sampling is used. Kept separate from MAX_COMBINATIONS
 # so the valid-list cap and the enumeration strategy can be tuned independently.
 SIGMA_INPUT_ELEMENT        = sigma.get_control_value('sigma-input-element')
+# Name of the Sigma input table to read billing data from ("Input Data
+# Table Name" is this control's display label). One of: "Input",
+# "Input_GEM", "Uploaded File". Drives which sigma.get_element() literal
+# is called in _sigma_main(); independent of WEATHER_SOURCE — Input and
+# Input_GEM both resolve their WeatherStation lookups via formulas already
+# present in the table itself (Input_GEM via Site2WeatherStation_GEM), so
+# no Python-side weather branching is needed based on this control.
 # Weather source toggle.
 # "sigma" (default) — HDD/CDD pulled from the SIGMA_WEATHER_ELEMENT Sigma
 #   element (expected to be present in the workbook alongside 'Input').
@@ -88,6 +110,21 @@ SIGMA_WEATHER_ELEMENT      = sigma.get_control_value('sigma-weather-element')
 REPORTING_OUTLIER_LOW      = sigma.get_control_value('reporting-outlier-floor')
 REPORTING_OUTLIER_HIGH     = sigma.get_control_value('reporting-outlier-ceil')
 
+# Minimum number of clean reporting bills required before an all-negative
+# savings result is allowed to exclude a site from the savings rollup.
+# A site whose ONLY reporting bill happens to come in negative is not evidence
+# of a trend — that's the normal state of a newly-commissioned customer whose
+# first bill has landed. Excluding it drops the site out of reporting entirely
+# on the strength of one observation. Two or more consecutive negative bills is
+# a pattern worth acting on; one is noise.
+# Note this gate only controls the Savings Status LABEL. Every cost figure is
+# calculated and published either way (see compute_cost_cols) — exclusion is a
+# filter the dashboard applies, not a reason to withhold the numbers.
+# Built as a literal rather than a sigma.get_control_value() lookup for now; if
+# this needs tuning per customer, swap it for a control the same way
+# REPORTING_OUTLIER_LOW/HIGH above are wired.
+MIN_REPORTING_BILLS_FOR_NEGATIVE_EXCLUSION = 2
+
 UNIT_CONVERSIONS = {
     "kwh": 1.0, "mwh": 1000.0, "wh": 0.001,
     "therms": 1.0, "therm": 1.0,
@@ -101,19 +138,38 @@ SCHEMAS = {
               "R2", "R2 Rating", "Passes R2", "CV-RMSE", "CV-RMSE Rating",
               "Passes CV-RMSE", "Weather Coverage (%)", "HDD Coverage (%)",
               "CDD Coverage (%)", "Weather Coverage Rating", "Passes Weather Coverage",
-              "Model Passes Quality", "Q1 Bills", "Q2 Bills", "Q3 Bills", "Q4 Bills",
-              "Temporal CV", "Total Avoided Usage", "Pct Avoided Usage", "Notes",
+              "Seasonal Balance", "Seasonal Balance Rating", "Passes Seasonal Balance",
+              "Model Passes Quality",
+              # Quarters are assigned by Period_Start_Date, and the label lags the
+              # weather it measures by roughly a month: a bill starting 12 Dec
+              # covers 12 Dec - 11 Jan, i.e. deep winter, but files under Q4. In
+              # this portfolio Q4 is the COLDEST quarter (HDD mean 178.5) and Q1 is
+              # second (163.1) — so season names like "Fall" would actively mislead.
+              # The month ranges are stated in the column names for that reason.
+              "Q1 Bills (Jan-Mar)", "Q2 Bills (Apr-Jun)",
+              "Q3 Bills (Jul-Sep)", "Q4 Bills (Oct-Dec)",
+              # Renamed from "Temporal CV". Same metric (std/mean of the four
+              # quarter counts x100), but "CV" is statistics jargon and the column
+              # sat next to Seasonal Balance without any hint of how they differ.
+              # Spread is symmetric: it penalises a quarter with too MANY bills as
+              # hard as one with too few. Seasonal Balance (min/mean) only cares
+              # about the thinnest quarter. They also run opposite ways —
+              # 0 is perfect here, 1.00 is perfect there.
+              "Quarterly Spread (%)", "Total Avoided Usage", "Pct Avoided Usage", "Notes",
               "Weight Flag", "Meter Weight (%)", "Coverage Flag",
               "Measured Rate", "Modeled Cost ($)", "Actual Cost ($)",
               "Avoided Cost ($)", "Avg Monthly Avoided Cost",
               "Total Modeled Usage", "Total Actual Usage",
               "Savings Exclusion Flag", "Savings Status",
-              "New Site", "CV Ceiling Relaxed"],
+              "New Site", "CV Ceiling Relaxed",
+              "Site Meter Key", "Recommended", "Recommendation Reason"],
     "bills": ["Site Name", "Meter Number", "Service Type", "Period Type", "Status",
               "Period Start Date", "Period End Date", "HDD", "CDD",
               "Consumption", "Total Charges", "Predicted Consumption",
               "Avoided Usage", "Pct Avoided", "Bill Avoided Cost",
-              "Selected Baseline", "Weather Source"],
+              "Individual Selected Baseline", "Aggregated Selected Baseline",
+              "Weather Source",
+              "Site Meter Key", "Recommended", "Recommendation Reason"],
     "reporting": ["Site Name", "Meter Number", "Service Type", "Period Type", "Status",
                   "Period Start Date", "Period End Date", "HDD", "CDD",
                   "Consumption", "Total Charges", "Predicted Consumption",
@@ -121,6 +177,7 @@ SCHEMAS = {
                   "Model Passes Quality", "Savings Status", "Reporting Count",
                   "R2", "CV-RMSE", "Weather Coverage (%)",
                   "Passes R2", "Passes CV-RMSE", "Passes Weather Coverage",
+                  "Seasonal Balance", "Passes Seasonal Balance",
                   "Weather Source"],
     "outliers": ["Site Name", "Meter Number", "Service Type",
                  "Period Start Date", "Period End Date", "HDD", "CDD",
@@ -129,6 +186,14 @@ SCHEMAS = {
                 "Baseline Consumption", "Meter Weight (%)", "Weight Source",
                 "Individual Model Passes", "Individual R2", "Individual CV-RMSE",
                 "Individual Pct Avoided", "Coverage Flag", "Aggregate Weight Flag"],
+    # cost_only_review: lists every site that was skipped from optimization
+    # because it has more than one PUBLISHER bill for the same billing period
+    # (i.e. automated PUBLISHER/PASS_THROUGH consolidation could not be
+    # performed safely). This table is intentionally separate from "outliers"
+    # — these aren't statistical outliers, they're data-integrity problems
+    # that block automated consolidation. Sites appearing here are skipped
+    # entirely from optimization (see run_analysis) until a human resolves it.
+    "cost_only_review": ["Site Name", "Issue Type", "Action Required", "Notes"],
 }
 
 
@@ -178,8 +243,10 @@ def _safe_df(rows, schema_key):
 def preprocess(df: pd.DataFrame) -> tuple:
     """
     Normalise column names, parse dates/numerics, convert units.
-    Returns (processed_df, df_original, has_locked_baseline).
+    Returns (processed_df, df_original, has_locked_baseline, cost_only_flagged_sites).
     df_original retains original column name formatting for input_with_baseline output.
+    cost_only_flagged_sites is an empty set unless the Provider Classification
+    column is present in the input (see consolidate_cost_only_bills for behavior).
     """
     df = df.copy()
     df.columns = df.columns.str.strip()
@@ -219,17 +286,58 @@ def preprocess(df: pd.DataFrame) -> tuple:
 
     df = _convert_units(df)
 
-    if "Selected_Baseline" in df.columns:
-        df["Selected_Baseline"] = df["Selected_Baseline"].apply(
-            lambda v: "1" if str(v).strip() in ("1", "1.0") else ""
-        )
+    # ── Cost-only (PUBLISHER / PASS_THROUGH) consolidation ─────────────────
+    # Must run AFTER unit conversion (so kept Consumption values are already
+    # in canonical units) and AFTER Total_Charges is numeric (so charges can
+    # be summed), but BEFORE infer_flags()/optimization ever see the rows.
+    # No-ops entirely if the classification column isn't in this input.
+    # Returns the consolidated df plus the set of sites flagged for skip
+    # (more than one PUBLISHER bill in any period group).
+    df, cost_only_flagged_sites = consolidate_cost_only_bills(df)
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── Selected Baseline column resolution ────────────────────────────────
+    # The input may arrive in either shape:
+    #   NEW    — "Individual Selected Baseline" + "Aggregated Selected Baseline"
+    #   LEGACY — a single "Selected Baseline"
+    # Internally the script keeps calling the individual-model column
+    # "Selected_Baseline", so optimize_from_locked(), the has_locked gate and
+    # the per-meter locking checks all continue to work untouched; only the
+    # resolution below is new.
+    #
+    # A legacy single column is read as the INDIVIDUAL selection. That's the
+    # correct reading: before the split there was no way to lock an aggregate
+    # baseline at all, so every "1" in an old file came from a per-meter model
+    # (or from the write-back bug that leaked aggregate selections onto meter
+    # rows — which this split is what fixes).
+    _norm_sb = lambda v: "1" if str(v).strip() in ("1", "1.0") else ""
+
+    if "Individual_Selected_Baseline" in df.columns:
+        df["Selected_Baseline"] = df["Individual_Selected_Baseline"].apply(_norm_sb)
+        df = df.drop(columns=["Individual_Selected_Baseline"])
+    elif "Selected_Baseline" in df.columns:
+        df["Selected_Baseline"] = df["Selected_Baseline"].apply(_norm_sb)
+        print("[INFO] Input has a legacy single 'Selected Baseline' column — "
+              "reading it as the individual-meter selection. Add "
+              "'Individual Selected Baseline' and 'Aggregated Selected Baseline' "
+              "columns to lock aggregate baselines separately.")
+
+    # Aggregated selections are read and carried through, but nothing consumes
+    # them yet — aggregates still re-optimize on every run (see the aggregate
+    # block in run_analysis, which calls optimize() directly and has no
+    # optimize_from_locked() equivalent). Normalising here so the column
+    # round-trips cleanly and is ready when that lands.
+    if "Aggregated_Selected_Baseline" in df.columns:
+        df["Aggregated_Selected_Baseline"] = \
+            df["Aggregated_Selected_Baseline"].apply(_norm_sb)
+    # ───────────────────────────────────────────────────────────────────────
 
     has_locked = (
         "Selected_Baseline" in df.columns
         and (df["Selected_Baseline"] == "1").any()
     )
 
-    return df, df_original, has_locked
+    return df, df_original, has_locked, cost_only_flagged_sites
 
 
 def _convert_units(df: pd.DataFrame) -> pd.DataFrame:
@@ -241,6 +349,118 @@ def _convert_units(df: pd.DataFrame) -> pd.DataFrame:
         if factor and factor != 1.0:
             df.loc[idx, "Consumption"] *= factor
     return df
+
+
+# ── Cost-only bill consolidation (PUBLISHER / PASS_THROUGH) ───────────────────
+
+# Column name for the provider-classification field. Built as a literal for
+# now per project decision (2026-06) rather than a sigma.get_control_value()
+# lookup, since the column doesn't exist in every input and the name may
+# still change. If this ever needs to be configurable, swap the literal below
+# for a control value the same way INPUT_DATA_TABLE_NAME / SIGMA_INPUT_ELEMENT
+# works elsewhere in this script — just remember to update both this constant
+# AND the COST_ONLY_CLASSIFICATION_COL_RAW comment-reference together.
+COST_ONLY_CLASSIFICATION_COL = "Provider_Classification"  # post space->underscore rename
+
+# Output header text for the two baseline-selection columns. A single
+# "Selected Baseline" column could not represent both an individual meter
+# model's selection and the site aggregate's, so it was split. The input is
+# still accepted in the legacy single-column shape (read as the individual
+# selection) — see preprocess.
+# Text used on rows that ARE recommended. Deliberately NOT an empty string:
+# a blank is not a value a dashboard filter can select FOR. Sigma will happily
+# COUNT the blanks (its dropdown showed 116) and then match none of them, because
+# a value-list filter compiles to `col IN (...)` and `IN (NULL)` is never true in
+# SQL. That made the single most useful view — "show me the rows that ARE
+# recommended, with nothing wrong" — the one view impossible to select. Real text
+# is filterable, greppable, and reads correctly in an exported table.
+RECOMMENDED_NO_REASON = "Recommended — no exclusions apply"
+
+IND_SB_COL = "Individual Selected Baseline"
+AGG_SB_COL = "Aggregated Selected Baseline"
+
+PUBLISHER_LABEL     = "PUBLISHER"
+PASS_THROUGH_LABEL  = "PASS_THROUGH"
+
+
+def consolidate_cost_only_bills(df: pd.DataFrame) -> tuple:
+    """
+    Consolidate PUBLISHER + PASS_THROUGH "cost only" bill pairs, and flag
+    any site that has more than one PUBLISHER bill for the same billing
+    period (such sites are excluded from analysis until corrected).
+
+    Rule:
+      - Consumption comes from the PUBLISHER row only (never summed —
+        PASS_THROUGH restates usage, it doesn't add to it).
+      - Total Charges is the sum of PUBLISHER + PASS_THROUGH for the period.
+      - A period group is identified by
+        (Site_Name, Meter_Number, Period_Start_Date, Period_End_Date, Service_Type).
+      - A site is FLAGGED (and all its rows dropped) if any of its period
+        groups has either:
+          * more than one PUBLISHER bill, or
+          * one or more PASS_THROUGH bills with no matching PUBLISHER bill
+            (orphan passthrough — can't be consolidated against anything).
+        Pass-through *counts* beyond presence are not otherwise validated.
+
+    No-op if the classification column isn't present.
+
+    Returns:
+        (consolidated_df, flagged_sites)
+    """
+    if COST_ONLY_CLASSIFICATION_COL not in df.columns:
+        return df, set()
+
+    df = df.copy()
+    group_cols = ["Site_Name", "Meter_Number", "Period_Start_Date",
+                  "Period_End_Date", "Service_Type"]
+
+    # Separate Publisher and Passthrough (mirrors FileProcessor.py)
+    publisher  = df[df[COST_ONLY_CLASSIFICATION_COL] == PUBLISHER_LABEL].copy()
+    passthrough = df[df[COST_ONLY_CLASSIFICATION_COL] == PASS_THROUGH_LABEL].copy()
+    # Anything not classified as either is left untouched and re-attached at the end.
+    other = df[~df[COST_ONLY_CLASSIFICATION_COL].isin([PUBLISHER_LABEL, PASS_THROUGH_LABEL])].copy()
+
+    # ── Flagging ────────────────────────────────────────────────────────────
+    # Per-group publisher/passthrough counts, so we can catch two problems:
+    #   (1) >1 PUBLISHER bill in a group (can't pick which usage is real)
+    #   (2) PASS_THROUGH present but 0 PUBLISHER in a group (orphan — nothing
+    #       to consolidate against)
+    pub_counts = publisher.groupby(group_cols).size().reset_index(name="pub_count")
+    pas_counts = passthrough.groupby(group_cols).size().reset_index(name="pas_count")
+    grp = pub_counts.merge(pas_counts, on=group_cols, how="outer").fillna(
+        {"pub_count": 0, "pas_count": 0})
+
+    multi_pub_sites = set(
+        grp.loc[grp["pub_count"] > 1, "Site_Name"].unique()
+    )
+    orphan_pas_sites = set(
+        grp.loc[(grp["pas_count"] > 0) & (grp["pub_count"] == 0), "Site_Name"].unique()
+    )
+    flagged_sites = multi_pub_sites | orphan_pas_sites
+
+    # Drop everything belonging to a flagged site, across all three buckets.
+    publisher   = publisher[~publisher["Site_Name"].isin(flagged_sites)]
+    passthrough = passthrough[~passthrough["Site_Name"].isin(flagged_sites)]
+    other       = other[~other["Site_Name"].isin(flagged_sites)]
+
+    # ── Consolidate charges ─────────────────────────────────────────────────
+    # Sum Total_Charges per period group across BOTH classifications.
+    charges = (
+        pd.concat([publisher, passthrough])
+          .groupby(group_cols, dropna=False)["Total_Charges"]
+          .sum()                       # all-NaN group -> 0 (pandas default)
+          .reset_index()
+    )
+
+    # Publisher rows carry Consumption + all other fields; one row per group now.
+    consolidated = publisher.drop(columns=["Total_Charges"]).merge(
+        charges, on=group_cols, how="left"
+    )
+
+    # Re-attach unclassified rows untouched.
+    result = pd.concat([consolidated, other], ignore_index=True)
+
+    return result, flagged_sites
 
 
 def infer_flags(df: pd.DataFrame) -> pd.DataFrame:
@@ -317,27 +537,159 @@ def fit_model(baseline: pd.DataFrame, is_gas: bool):
     return m, r2_score(y, pred), _calc_cvrmse(y, pred)
 
 
-def _weather_coverage(selected: pd.DataFrame, all_baseline: pd.DataFrame):
+def _weather_coverage(selected: pd.DataFrame, all_baseline: pd.DataFrame,
+                      is_gas: bool = False):
+    """
+    How much of the baseline's observed weather range does the selection span?
+
+    Returns (overall, hdd_coverage, cdd_coverage).
+
+    is_gas controls what "overall" means, and it matters:
+      A gas model is fitted on HDD ALONE — fit_model() passes only [["HDD"]] for
+      gas, and the equation carries no CDD term. Averaging CDD coverage into the
+      headline number therefore blends in a dimension the model never uses, and
+      it does so in the direction that hides problems. URB027/2066266 spans just
+      60.0% of its HDD range — the only range its model will ever be asked to
+      predict over — but scored 100.0% on CDD, averaging to 80.0%: past the 75%
+      gate, rated "Excellent". Same at URB032 (66.0% HDD -> 83.0% overall) and
+      URB018 (66.8% -> 82.7%).
+
+      HDD and CDD coverage are both still reported for gas — they're useful to
+      see — but only HDD drives the gate.
+    """
     def cov(col):
         full_r = all_baseline[col].max() - all_baseline[col].min()
         sel_r  = selected[col].max()    - selected[col].min()
         return (sel_r / full_r * 100) if full_r > 0 else 100.0
     hdd_c, cdd_c = cov("HDD"), cov("CDD")
-    return (hdd_c + cdd_c) / 2, hdd_c, cdd_c
+    overall = hdd_c if is_gas else (hdd_c + cdd_c) / 2
+    return overall, hdd_c, cdd_c
+
+
+def _seasonal_balance(selected: pd.DataFrame) -> float:
+    """
+    The number behind "Passes Seasonal Balance": the WEAKEST quarter's bill count
+    as a fraction of the average quarter. 1.00 = perfectly even, 0.00 = a season
+    with no bills at all.
+
+    This is the metric _seasonal_ok() gates on, exposed so the verdict can be
+    checked rather than taken on faith — every other gate in the model tables
+    shows its value beside its flag, and this one didn't.
+
+    NOT the same as Temporal CV, which also summarises the quarterly counts but
+    answers a different question. Temporal CV is std/mean: symmetric dispersion,
+    penalising a quarter with too MANY bills exactly as hard as one with too few.
+    Seasonal balance is min/mean: it only cares about the thinnest season,
+    because that is the one the model barely knows. Quarters [2,4,4,4] score a
+    comfortable 28.6 on Temporal CV (under the 40 ceiling) while scoring 0.57
+    here — a real gap in spring that dispersion averages away. They also run in
+    opposite directions: 0 is perfect for Temporal CV, 1.00 is perfect here.
+    """
+    counts = selected["Period_Start_Date"].dt.quarter.value_counts()
+    vals   = [counts.get(q, 0) for q in [1, 2, 3, 4]]
+    mean_c = sum(vals) / 4
+    return 0.0 if mean_c == 0 else min(vals) / mean_c
+
+
+def _quarterly_spread(selected: pd.DataFrame, idle_q: int = None) -> float:
+    """
+    Standard deviation / mean of the quarterly bill counts, x100. 0 = perfectly
+    even. Guards SHAPE — Seasonal Balance only looks at the weakest quarter and
+    scores [2,2,2,6] and [2,3,3,4] identically at 0.67; this separates them
+    (66.7 vs 27.2).
+
+    idle_q is excluded, for the same reason _seasonal_ok excludes it from the
+    balance calculation: if a quarter is exempt from the bill-count floor because
+    its bills carry no slope information, it must not drag the shape metric
+    either. Without this the two gates contradict each other — the exemption
+    permits gas [2,2,1,3], then spread scores it 40.8 against a 40 ceiling and
+    rejects it by 0.8. Excluding the idle quarter scores the same baseline on its
+    graded quarters [2,2,3] -> 24.7, which passes on its merits.
+
+    (That contradiction was live but invisible: the ceiling is skipped entirely
+    for new sites, so [2,2,1,3] existed at URB009/URB026/URB028/URB034 — all new
+    — and was silently impossible everywhere else.)
+    """
+    counts = selected["Period_Start_Date"].dt.quarter.value_counts()
+    graded = [counts.get(q, 0) for q in [1, 2, 3, 4] if q != idle_q]
+    ser    = pd.Series(graded, dtype=float)
+    if len(ser) < 2 or ser.mean() == 0:
+        return 0.0
+    return float(ser.std() / ser.mean() * 100)
+
+
+def _idle_quarter(pool: pd.DataFrame, is_gas: bool):
+    """
+    For a GAS baseline, the quarter whose bills carry no slope information.
+
+    A gas model is fitted on HDD alone. Bills from the site's warmest quarter sit
+    at HDD ~ 0 — they all share essentially the same x-value, so they pin the
+    intercept and say nothing about the heating slope. Demanding the same bill
+    density there as in winter is demanding redundant data, and on an 8-bill gas
+    baseline that demand is fatal: 4 quarters x 2 bills = 8 exactly, so a flat
+    minimum of 2 admits [2,2,2,2] and nothing else. Exempting the idle quarter is
+    what makes [2,2,1,3] reachable.
+
+    Returns None for electric. An electric model is fitted on HDD AND CDD, so
+    every quarter is informative about one term or the other — there is no idle
+    quarter to exempt.
+
+    The quarter is DERIVED FROM THIS SITE'S OWN BILLS, never hardcoded. Calendar
+    quarters do not map to seasons the same way everywhere: in this portfolio the
+    warmest quarter is Q3 (mean HDD 7) and the COLDEST is Q4 (mean HDD 179, above
+    even Q1's 163), because quarters are assigned by Period_Start_Date and a bill
+    starting 12 Dec measures 12 Dec - 11 Jan. Hardcoding "Q3 is summer" would be
+    wrong the first time this runs on a portfolio in another climate.
+
+    Requires a real margin: the idle quarter must have a mean HDD below 25% of
+    the next-lowest quarter's. Without that, a site whose quarters all carry
+    similar HDD would have one arbitrarily exempted for winning a coin flip.
+    """
+    if not is_gas or "HDD" not in pool.columns:
+        return None
+    hdd = pool.groupby(pool["Period_Start_Date"].dt.quarter)["HDD"].mean()
+    if len(hdd) < 4:
+        return None
+    order = hdd.sort_values()
+    lowest, second = order.index[0], order.iloc[1]
+    return int(lowest) if order.iloc[0] <= 0.25 * second else None
 
 
 def _seasonal_ok(selected: pd.DataFrame, min_per_q: int,
-                 balance_threshold: float = SEASONAL_BALANCE_THRESHOLD) -> bool:
+                 balance_threshold: float = SEASONAL_BALANCE_THRESHOLD,
+                 idle_q: int = None) -> bool:
+    """
+    Two independent checks, both required:
+
+      1. min_per_q  — every quarter carries at least this many bills. Guards
+                      against a season the model has barely seen.
+      2. balance    — the weakest quarter is at least balance_threshold of the
+                      mean quarter. Stated as a RATIO rather than an integer so
+                      it scales: a locked baseline can be any size (24 bills, or
+                      19), and "min >= 2" would be meaningless on 24 while
+                      "min/mean >= 0.65" means min >= 4 there and min >= 2 on 12.
+
+    Neither of these constrains the SHAPE above the minimum — [2,2,2,6] and
+    [2,3,3,4] both score exactly 0.67 here. That job belongs to the Quarterly
+    Spread ceiling in _run_strategy, which separates them (66.7 vs 27.2).
+
+    idle_q, when set, is a quarter allowed one fewer bill and excluded from the
+    balance calculation. See _idle_quarter.
+    """
     counts = selected["Period_Start_Date"].dt.quarter.value_counts()
-    if not all(counts.get(q, 0) >= min_per_q for q in [1, 2, 3, 4]):
-        return False
-    # Hard balance gate: no quarter may have less than balance_threshold
-    # of the mean quarter count. Prevents skewed baselines like [1,4,2,1].
-    # Gas sites use GAS_SEASONAL_BALANCE_THRESHOLD (0.50) because heating-only
-    # meters structurally have thin Q3 after zero-consumption summer bills
-    # are removed as outliers.
-    vals = [counts.get(q, 0) for q in [1, 2, 3, 4]]
-    mean_count = sum(vals) / 4
+
+    for q in [1, 2, 3, 4]:
+        floor = max(1, min_per_q - 1) if q == idle_q else min_per_q
+        if counts.get(q, 0) < floor:
+            return False
+
+    # The idle quarter is dropped from the balance calculation rather than
+    # counted at its relaxed floor. Leaving it in would drag the ratio down for a
+    # thinness that was deliberately permitted — the gate would grant the
+    # exemption with one hand and fail the baseline for using it with the other.
+    graded = [q for q in [1, 2, 3, 4] if q != idle_q]
+    vals   = [counts.get(q, 0) for q in graded]
+    mean_count = sum(vals) / len(vals) if vals else 0
     return mean_count == 0 or (min(vals) / mean_count) >= balance_threshold
 
 
@@ -370,9 +722,13 @@ def eval_combo(idx_list, baseline_pool, reporting_bills, all_baseline,
                r2_thresh, is_gas):
     selected          = baseline_pool.iloc[list(idx_list)]
     model, r2, cvrmse = fit_model(selected, is_gas)
-    wc, hdd_c, cdd_c  = _weather_coverage(selected, all_baseline)
+    wc, hdd_c, cdd_c  = _weather_coverage(selected, all_baseline, is_gas)
     qcounts           = selected["Period_Start_Date"].dt.quarter.value_counts()
-    temporal_cv       = (qcounts.std() / qcounts.mean() * 100) if len(qcounts) > 1 else 0.0
+    # Excludes the idle quarter, matching the gate and _seasonal_ok's balance
+    # calculation. All three must agree, or the reported number explains a
+    # verdict it didn't produce — and _combo_score ranks on this same value, so
+    # a mismatch would also skew which baseline wins.
+    temporal_cv       = _quarterly_spread(selected, _idle_quarter(all_baseline, is_gas))
 
     clean_rep, rep_outliers = detect_reporting_outliers(model, reporting_bills, is_gas)
     if len(clean_rep) > 0:
@@ -397,19 +753,50 @@ def eval_combo(idx_list, baseline_pool, reporting_bills, all_baseline,
         "wc_overall": wc, "wc_hdd": hdd_c, "wc_cdd": cdd_c, "temporal_cv": temporal_cv,
         "passes_r2": round(r2, 2) >= r2_thresh, "passes_cvrmse": round(cvrmse, 2) <= CVRMSE_THRESHOLD,
         "passes_wc": round(wc, 1) >= WEATHER_COVERAGE_THRESHOLD,
-        "passes_all": round(r2, 2) >= r2_thresh and round(cvrmse, 2) <= CVRMSE_THRESHOLD and round(wc, 1) >= WEATHER_COVERAGE_THRESHOLD,
+        # Stated explicitly rather than left implicit. On this path it is True by
+        # construction — _run_strategy() pre-filters every combination through
+        # _seasonal_ok() before it is ever scored, so a failing combination cannot
+        # reach here. Reporting it anyway keeps "Passes Seasonal Balance" meaning
+        # the same thing on the optimized and locked paths, instead of being a
+        # column that only one path populates honestly.
+        "passes_seasonal": _seasonal_ok(
+            selected, PREFERRED_MIN_PER_QUARTER,
+            GAS_SEASONAL_BALANCE_THRESHOLD if is_gas else SEASONAL_BALANCE_THRESHOLD,
+            idle_q=_idle_quarter(all_baseline, is_gas)),
+        "seasonal_balance": _seasonal_balance(selected),
+        # passes_seasonal is folded in here as well as on the locked path. It used
+        # to be a no-op on this path — _run_strategy() pre-filters every
+        # combination through _seasonal_ok() before scoring, so anything reaching
+        # eval_combo() satisfied it by construction. That stopped being true the
+        # moment the most-recent-N rung was added: that rung does no filtering at
+        # all, so its baseline can and usually does fail seasonal balance. Without
+        # this, such a model could report Model Passes Quality = True purely on
+        # R2/CV-RMSE and walk into the KPI tiles.
+        "passes_all": (round(r2, 2) >= r2_thresh
+                       and round(cvrmse, 2) <= CVRMSE_THRESHOLD
+                       and round(wc, 1) >= WEATHER_COVERAGE_THRESHOLD
+                       and _seasonal_ok(selected, PREFERRED_MIN_PER_QUARTER,
+                                        GAS_SEASONAL_BALANCE_THRESHOLD if is_gas
+                                        else SEASONAL_BALANCE_THRESHOLD,
+                                        idle_q=_idle_quarter(all_baseline, is_gas))),
         "total_avoided": avoided, "pct_avoided": pct_avd, "reporting_count": len(clean_rep),
         **{f"Q{q}_Bills": int(qcounts.get(q, 0)) for q in [1, 2, 3, 4]},
     }
 
 
 def optimize(site_id, service_type, bills, baseline_count, r2_thresh):
+    """
+    Returns (result_or_None, bl_outlier_records, rep_outlier_records, skip_reason).
+    skip_reason is None on success; otherwise a human-readable string explaining
+    why no model could be fit, so callers can surface it in all_models
+    and outliers instead of the site silently vanishing with no trace.
+    """
     is_gas        = _is_gas(service_type)
     raw_baseline  = bills[bills["Baseline_Bill"] == 1].copy()
     reporting_all = bills[bills["Reporting_Bill"] == 1].copy()
 
     if len(raw_baseline) == 0:
-        return None, [], []
+        return None, [], [], "No baseline bills found (all bills fall on/after Commission Date)"
 
     clean_baseline, bl_outliers = detect_baseline_outliers(raw_baseline)
 
@@ -426,7 +813,10 @@ def optimize(site_id, service_type, bills, baseline_count, r2_thresh):
     # ─────────────────────────────────────────────────────────────────────────
 
     if len(clean_baseline) < baseline_count:
-        return None, list(bl_outliers.to_dict("records")), []
+        return (None, list(bl_outliers.to_dict("records")), [],
+                f"Insufficient baseline data: only {len(clean_baseline)} clean baseline "
+                f"bill(s) available after outlier/missing-weather removal, "
+                f"{baseline_count} required")
 
     # ── Drop reporting bills with missing weather data ────────────────────────
     # Can't generate predictions without HDD/CDD; dropping here prevents a
@@ -440,6 +830,10 @@ def optimize(site_id, service_type, bills, baseline_count, r2_thresh):
     cv_relaxed = False
 
     bal_thresh = GAS_SEASONAL_BALANCE_THRESHOLD if is_gas else SEASONAL_BALANCE_THRESHOLD
+    # Derived once from the site's own clean pool, then reused for every
+    # combination — the idle quarter is a property of the site's climate, not of
+    # whichever 12 bills are being tested.
+    idle_q     = _idle_quarter(clean_baseline, is_gas)
 
     def _run_strategy(min_per_q):
         nonlocal cv_relaxed
@@ -451,14 +845,13 @@ def optimize(site_id, service_type, bills, baseline_count, r2_thresh):
         valid = []
         for c in combos:
             sel = clean_baseline.iloc[list(c)]
-            if not _seasonal_ok(sel, min_per_q, bal_thresh):
+            if not _seasonal_ok(sel, min_per_q, bal_thresh, idle_q=idle_q):
                 continue
-            wc, _, _ = _weather_coverage(sel, clean_baseline)
+            wc, _, _ = _weather_coverage(sel, clean_baseline, is_gas)
             if wc < WEATHER_COVERAGE_THRESHOLD:
                 continue
             if not is_new:
-                qc = sel["Period_Start_Date"].dt.quarter.value_counts()
-                if len(qc) > 1 and qc.std() / qc.mean() * 100 > TEMPORAL_CV_CEILING:
+                if _quarterly_spread(sel, idle_q) > TEMPORAL_CV_CEILING:
                     continue
             valid.append(c)
             if len(valid) >= MAX_COMBINATIONS:
@@ -472,9 +865,9 @@ def optimize(site_id, service_type, bills, baseline_count, r2_thresh):
                        else _random_combos(n, baseline_count, MAX_COMBINATIONS * 3))
             for c in combos2:
                 sel = clean_baseline.iloc[list(c)]
-                if not _seasonal_ok(sel, min_per_q, bal_thresh):
+                if not _seasonal_ok(sel, min_per_q, bal_thresh, idle_q=idle_q):
                     continue
-                wc, _, _ = _weather_coverage(sel, clean_baseline)
+                wc, _, _ = _weather_coverage(sel, clean_baseline, is_gas)
                 if wc >= WEATHER_COVERAGE_THRESHOLD:
                     valid.append(c)
                 if len(valid) >= MAX_COMBINATIONS:
@@ -514,34 +907,84 @@ def optimize(site_id, service_type, bills, baseline_count, r2_thresh):
 
         return best_pass_nonpos or best_fail
 
+    # One rung, not two. The old "Acceptable (>=1 bill per quarter)" retry was
+    # removed because it could never do anything: a fresh baseline is always
+    # exactly baseline_count bills, so the mean quarter is always exactly 3
+    # (electric) or 2 (gas), and the balance threshold converts to a flat
+    # minimum — 0.65 x 3 = 1.95, so min >= 2 regardless of what the floor said.
+    # A floor of 1 was strictly looser than a constraint already in force.
     result   = _run_strategy(PREFERRED_MIN_PER_QUARTER)
     strategy = f"Optimal (≥{PREFERRED_MIN_PER_QUARTER} bills per quarter)"
-    if result is None:
-        result   = _run_strategy(MINIMUM_MIN_PER_QUARTER)
-        strategy = f"Acceptable (≥{MINIMUM_MIN_PER_QUARTER} bill per quarter)"
 
     if result is None:
-        return None, list(bl_outliers.to_dict("records")), []
+        # ── Rung 4: most recent N bills, no optimization ─────────────────────
+        # Reached only when no combination satisfies the gates. Previously the
+        # site was skipped outright and the analyst got nothing to judge.
+        #
+        # WHY THE MOST RECENT N RATHER THAN A GATES-OFF SEARCH:
+        #   _combo_score() weights pct_avoided at 0.15. That is defensible only
+        #   because the candidate pool is pre-filtered to combinations that
+        #   already cleared the gates — "prefer positive savings AMONG
+        #   quality-passing models". Drop the gates and the same ranking becomes
+        #   "pick whichever baseline makes savings look best", with no
+        #   representativeness constraint. That is cherry-picking, and this
+        #   project has already ruled it out.
+        #   Most-recent-N has no ranking function, so there is nothing to game.
+        #   It is also deterministic (no seed, no sampling — immune to the
+        #   seed = n*1000+k reshuffle that moves a sampled baseline whenever the
+        #   clean-bill count changes), explainable to a customer, and closer to
+        #   textbook IPMVP than the optimizer is: Option C wants a contiguous
+        #   baseline period immediately preceding the intervention, which is
+        #   exactly "the last N bills before the commission date".
+        #
+        # Note this rung is only reachable when len(clean_baseline) >=
+        # baseline_count — the insufficient-data check above returns first — so
+        # "not enough bills" remains the ONLY reason a model is never built.
+        recent_pos = list(np.argsort(
+            clean_baseline["Period_Start_Date"].values, kind="stable")[-baseline_count:])
+        result   = eval_combo(recent_pos, clean_baseline, reporting_all,
+                              clean_baseline, r2_thresh, is_gas)
+        strategy = "Most recent bills — no optimization"
+        # No forcing of Recommended here, deliberately. This rung is a METHOD,
+        # not a defect: the site fell to it because its data has a real
+        # statistical problem (usually a season it has no bills for), and that
+        # problem is what should disqualify the model. passes_all above now
+        # includes the seasonal check, so an unrepresentative baseline fails on
+        # its own statistics and Recommended follows. If a most-recent-N baseline
+        # somehow cleared every gate it would deserve to be recommended — though
+        # in practice it cannot, since a combination clearing every gate would
+        # have been found by rung 1 or 2 and this rung would never have fired.
 
     result.update({
         "seasonal_strategy": strategy,
+        "optimization_mode": ("Most Recent" if strategy.startswith("Most recent")
+                              else "Optimized"),
         "is_new_site":        is_new,
         "cv_ceiling_relaxed": cv_relaxed,
         "bl_outliers_df":     bl_outliers,
         "reporting_all":      reporting_all,
     })
-    return result, list(bl_outliers.to_dict("records")), list(result["rep_outliers"].to_dict("records"))
+    return (result, list(bl_outliers.to_dict("records")),
+            list(result["rep_outliers"].to_dict("records")), None)
 
 
 def optimize_from_locked(site_id, service_type, bills, r2_thresh):
-    """Reconstruct a model from pre-selected baseline bills (Selected_Baseline == '1')."""
+    """
+    Reconstruct a model from pre-selected baseline bills (Selected_Baseline == '1').
+    Returns (result_or_None, bl_outlier_records, rep_outlier_records, skip_reason).
+    skip_reason is None on success; see optimize() for the convention.
+    """
+    #if has_locked:
+    #    print(f"[DEBUG] Columns at optimize_from_locked call: {list(meter_data.columns)}")
+    #    res, bl_out, rep_out, skip_reason = optimize_from_locked(...)
+
     is_gas         = _is_gas(service_type)
     baseline_bills = bills[bills["Selected_Baseline"].apply(
         lambda v: str(v).strip() in ("1", "1.0"))].copy()
     reporting_bills = bills[bills["Reporting_Bill"] == 1].copy()
 
     if len(baseline_bills) == 0:
-        return None, [], []
+        return None, [], [], "No locked baseline bills found (Selected Baseline column has no '1' rows for this site/meter)"
 
     baseline_bills["Period_Start_Date"] = pd.to_datetime(
         baseline_bills["Period_Start_Date"], errors="coerce")
@@ -559,17 +1002,91 @@ def optimize_from_locked(site_id, service_type, bills, r2_thresh):
     # ─────────────────────────────────────────────────────────────────────────
 
     if len(baseline_bills) == 0:
-        return None, list(nan_weather_bl.to_dict("records")), []
+        return (None, list(nan_weather_bl.to_dict("records")), [],
+                "All locked baseline bills were dropped due to missing weather data (HDD/CDD NaN)")
 
     # ── Drop reporting bills with missing weather data ────────────────────────
     rep_weather_cols = ["HDD"] if is_gas else ["HDD", "CDD"]
     reporting_bills  = reporting_bills.dropna(subset=rep_weather_cols)
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ── Reference pool for weather coverage / seasonal balance ───────────────
+    # Built the same way optimize() builds clean_baseline, so a locked model's
+    # quality numbers are directly comparable to an optimized one's.
+    #
+    # This block exists because _weather_coverage() was previously called as
+    # _weather_coverage(baseline_bills, baseline_bills) — the SAME frame twice.
+    # Its cov() computes sel_range / pool_range, so comparing a frame to itself
+    # is an identity: every locked model reported exactly 100.0% coverage,
+    # "Excellent", Passes = True, with zero variance across all 61 of them. Six
+    # gas meters (URB027/2066266 at a true 60.0%, URB041/2209522 at 63.5%,
+    # URB032/2181413 at 66.0%, URB018/1534919 at 66.8%, URB023/15995852 at
+    # 68.0%, URB020/15798100 at 69.2%) were sitting in the KPI tiles on a
+    # coverage claim that had never actually been computed. Gas hid it best:
+    # it selects 8 of an ~18-bill pool, so it frequently misses the HDD
+    # extremes, whereas electric takes 12 of 14-17 and usually catches them by
+    # accident.
+    raw_pool   = bills[bills["Baseline_Bill"] == 1].copy()
+    clean_pool, _ = detect_baseline_outliers(raw_pool)
+    clean_pool = clean_pool.dropna(subset=weather_cols)
+    if len(clean_pool) == 0:
+        clean_pool = baseline_bills          # degenerate; nothing else to compare against
+
     model, r2, cvrmse = fit_model(baseline_bills, is_gas)
-    wc, hdd_c, cdd_c  = _weather_coverage(baseline_bills, baseline_bills)
+    wc, hdd_c, cdd_c  = _weather_coverage(baseline_bills, clean_pool, is_gas)
+
+    # ── Seasonal balance on a locked baseline ────────────────────────────────
+    # optimize() enforces seasonal balance as a PRE-FILTER: a combination that
+    # fails it never gets scored, so any optimized model satisfies it by
+    # construction and passes_all doesn't need to restate it. The locked path
+    # has no such filter — _seasonal_ok() was never called here at all — so a
+    # locked baseline's representativeness went completely unexamined.
+    #
+    # That matters most for a baseline that was never optimized in the first
+    # place. Once a most-recent-N fallback model is locked and re-uploaded, its
+    # Optimization Mode becomes "Locked" and the fact that it was never
+    # optimized would vanish — while passes_all quietly collapsed to R2 and
+    # CV-RMSE alone, handing it Recommended = True on the second run.
+    #
+    # Re-deriving the check from the bills every run rather than remembering a
+    # flag makes it self-healing: an unrepresentative baseline stays flagged no
+    # matter how it got that way, including one a human hand-picked badly.
+    # PREFERRED_MIN_PER_QUARTER is the bar used because it is now the only
+    # bills-per-quarter gate optimize() applies.
+    bal_thresh     = GAS_SEASONAL_BALANCE_THRESHOLD if is_gas else SEASONAL_BALANCE_THRESHOLD
+    passes_seasonal = _seasonal_ok(baseline_bills, PREFERRED_MIN_PER_QUARTER, bal_thresh,
+                                   idle_q=_idle_quarter(clean_pool, is_gas))
+
+    # ── Did this locked baseline come from the most-recent-N fallback? ──────
+    # Re-derived from the bills rather than persisted in the file, so it can't
+    # drift out of sync with the baseline it describes. Three conditions, ALL
+    # required, because "the selection equals the most recent N" alone is not
+    # evidence of anything:
+    #
+    #   1. A CHOICE EXISTED (pool > N). With pool == N there is exactly one
+    #      possible baseline; it is trivially also "the most recent N", and the
+    #      optimizer had nothing to optimize. Observed at URB013/6516960
+    #      (12 bills, needs 12).
+    #   2. The selection IS the most recent N.
+    #   3. It FAILS a gate. This is the discriminator. optimize() would have
+    #      happily returned a most-recent-N baseline from rung 1 or 2 if it
+    #      cleared the gates and scored best — that is optimization arriving at
+    #      the same answer, not a fallback, and labelling it "no optimization"
+    #      would be a lie. Observed at URB033/AA034899520 (pool 14, chose the
+    #      last 12, passes everything) and URB041/6906426 (pool 16, same).
+    #      A baseline that fails a gate is one optimize() could NOT have chosen,
+    #      so the fallback is the only path that produces it.
+    _n         = len(baseline_bills)
+    _sel_dates = sorted(pd.to_datetime(baseline_bills["Period_Start_Date"]).tolist())
+    _recent    = sorted(pd.to_datetime(clean_pool["Period_Start_Date"])
+                          .sort_values().tail(_n).tolist())
+    is_most_recent = (len(clean_pool) > _n
+                      and _sel_dates == _recent
+                      and not (passes_seasonal
+                               and round(wc, 1) >= WEATHER_COVERAGE_THRESHOLD))
+
     qcounts           = baseline_bills["Period_Start_Date"].dt.quarter.value_counts()
-    temporal_cv       = (qcounts.std() / qcounts.mean() * 100) if len(qcounts) > 1 else 0.0
+    temporal_cv       = _quarterly_spread(baseline_bills, _idle_quarter(clean_pool, is_gas))
 
     clean_rep, rep_outliers = detect_reporting_outliers(model, reporting_bills, is_gas)
     if len(clean_rep) > 0:
@@ -597,9 +1114,29 @@ def optimize_from_locked(site_id, service_type, bills, r2_thresh):
         "wc_overall": wc, "wc_hdd": hdd_c, "wc_cdd": cdd_c, "temporal_cv": temporal_cv,
         "passes_r2": round(r2, 2) >= r2_thresh, "passes_cvrmse": round(cvrmse, 2) <= CVRMSE_THRESHOLD,
         "passes_wc": round(wc, 1) >= WEATHER_COVERAGE_THRESHOLD,
-        "passes_all": round(r2, 2) >= r2_thresh and round(cvrmse, 2) <= CVRMSE_THRESHOLD and round(wc, 1) >= WEATHER_COVERAGE_THRESHOLD,
+        "passes_seasonal": passes_seasonal,
+        "seasonal_balance": _seasonal_balance(baseline_bills),
+        # passes_seasonal is folded in HERE but not on the optimize() path, and
+        # that asymmetry is deliberate: optimize() guarantees it by pre-filter,
+        # so restating it there changes nothing. Here it is the only thing
+        # standing between an unrepresentative locked baseline and a green
+        # "Model Passes Quality". Including it makes the column mean one thing
+        # on both paths — R2 + CV-RMSE + weather coverage + seasonal balance —
+        # rather than silently meaning less whenever a baseline is locked.
+        "passes_all": (round(r2, 2) >= r2_thresh
+                       and round(cvrmse, 2) <= CVRMSE_THRESHOLD
+                       and round(wc, 1) >= WEATHER_COVERAGE_THRESHOLD
+                       and passes_seasonal),
         "total_avoided": avoided, "pct_avoided": pct_avd, "reporting_count": len(clean_rep),
-        "seasonal_strategy": "Locked (pre-selected)",
+        # Re-derived, not remembered. Answers your question directly: a
+        # most-recent-N baseline that gets saved and re-uploaded still says so,
+        # rather than collapsing to a bare "Locked" that hides how it was built.
+        # An analyst who hand-picked exactly the last N bills gets the same
+        # label — which is accurate, because that IS what the baseline is.
+        "seasonal_strategy": ("Most recent bills — no optimization" if is_most_recent
+                              else "Locked (pre-selected)" if passes_seasonal
+                              else "Locked — baseline not seasonally balanced"),
+        "optimization_mode": "Locked",
         "is_new_site": is_new,
         "cv_ceiling_relaxed": not is_new and temporal_cv > TEMPORAL_CV_CEILING,
         "reporting_all": reporting_bills, "bl_outliers_df": bl_outliers_df,
@@ -607,7 +1144,7 @@ def optimize_from_locked(site_id, service_type, bills, r2_thresh):
     }
     bl_out  = list(nan_weather_bl.to_dict("records")) if len(nan_weather_bl) > 0 else []
     rep_out = list(rep_outliers.to_dict("records"))   if len(rep_outliers)  > 0 else []
-    return result, bl_out, rep_out
+    return result, bl_out, rep_out, None
 
 
 # ── Multi-meter helpers ───────────────────────────────────────────────────────
@@ -625,17 +1162,205 @@ def meters_concurrent(site_data: pd.DataFrame) -> bool:
     return False
 
 
-def aggregate_site(site_data: pd.DataFrame) -> pd.DataFrame:
+def drop_incomplete_meter_periods(site_data: pd.DataFrame,
+                                  pooled_meters: list) -> tuple:
+    """
+    Drop billing periods in which fewer than ALL pooled meters have a bill.
+
+    WHY THIS EXISTS
+      aggregate_site() sums Consumption/Total_Charges per
+      (Period_Start_Date, Period_End_Date) with no check on how many meters
+      actually landed in each group. When a concurrent site is missing one
+      meter's bill for a period — because the meter was installed partway
+      through the baseline, removed partway through, or simply didn't get
+      read — the "AGGREGATED (N)" row for that period silently contains
+      FEWER than N meters' consumption, while still being fitted and scored
+      as though it were the full N-meter load.
+
+      The result is not noise, it is bias, because meter presence usually
+      correlates with the calendar and therefore with weather. Observed at
+      URB013 (2026-07-13 run): meter 6516960 has no bills before ~Mar 2025,
+      so the three highest-HDD baseline periods (Dec/Jan/Feb) were 1-meter
+      rows at ~2,700 kWh while the mild months were 2-meter rows at ~7,000.
+      The regression concluded that colder weather means LESS electricity
+      and produced a NEGATIVE HDD coefficient (-17.2612) — at R² = 0.91,
+      passing every quality gate. URB002 had the mirror image: the 1-meter
+      rows were the mild months, so HDD/CDD coefficients were inflated to
+      +34.4/+33.5 and one reporting bill claimed +$479.67 of savings that
+      was really just the missing meter.
+
+      Dropping the incomplete periods is the defensible fix: a period where
+      we only have part of the site's load is not an observation of the
+      site's load, and there is no IPMVP-defensible way to impute the
+      missing meter (that would be inventing baseline data). Sites that then
+      fall under the 12/8 bill gate genuinely do not have enough complete
+      periods to support an aggregate, and should fail.
+
+    SCOPE
+      Called only from the CONCURRENT aggregation path. The sequential-meter
+      path also calls aggregate_site(), but there the meters deliberately do
+      NOT share periods — the "aggregate" is a stitch of successive meters,
+      so every period legitimately has exactly one meter and this filter
+      would (correctly, but uselessly) delete the entire series. Keeping the
+      filter out of aggregate_site() itself means the sequential path is
+      untouched.
+
+    Args:
+        site_data:     raw per-meter bills, already restricted to the meters
+                       being pooled (i.e. post qualifying_meters filter).
+        pooled_meters: the meters expected in every period.
+
+    Returns:
+        (filtered_df, coverage_note)
+        coverage_note is "" when nothing was dropped, otherwise a
+        human-readable summary naming the periods and the missing meters,
+        for the Notes / skip-reason fields.
+    """
+    n_expected = len(pooled_meters)
+    if n_expected < 2 or len(site_data) == 0:
+        return site_data, ""
+
+    # nunique (not size) so a duplicate bill for one meter can't masquerade
+    # as coverage from two different meters.
+    per_period_meters = site_data.groupby(
+        ["Period_Start_Date", "Period_End_Date"]
+    )["Meter_Number"].transform("nunique")
+
+    keep    = per_period_meters >= n_expected
+    dropped = site_data.loc[~keep]
+    if len(dropped) == 0:
+        return site_data, ""
+
+    # Summarise what went missing, so an analyst reading Notes can see why a
+    # site's aggregate baseline shrank (or vanished) instead of guessing.
+    expected_set = set(map(str, pooled_meters))
+    detail = []
+    for (ps, _pe), grp in dropped.groupby(["Period_Start_Date", "Period_End_Date"]):
+        missing = sorted(expected_set - set(grp["Meter_Number"].astype(str)))
+        detail.append(f"{pd.to_datetime(ps).date()} (missing {', '.join(missing)})")
+
+    n_periods = len(detail)
+    note = (
+        f"Aggregate excluded {n_periods} billing period(s) where not all "
+        f"{n_expected} pooled meters had a bill — an incomplete period "
+        f"under-states site load and biases the model: "
+        f"{'; '.join(detail[:6])}"
+        f"{f'; +{n_periods - 6} more' if n_periods > 6 else ''}"
+    )
+    return site_data.loc[keep], note
+
+
+AGG_SB_INTERNAL = "Aggregated_Selected_Baseline"   # post space->underscore rename
+
+
+def aggregate_site(site_data: pd.DataFrame,
+                   agg_lock_col: str = None) -> pd.DataFrame:
+    """
+    Collapse per-meter bills into one row per billing period.
+
+    agg_lock_col — when supplied (the CONCURRENT path), the returned rows carry
+      the AGGREGATE's own locked baseline in "Selected_Baseline", rebuilt from
+      that column, instead of whatever the individual meters had flagged.
+
+      Two things make this work:
+
+      1. ALL-meters semantics. A period counts as locked only if EVERY pooled
+         meter's row for that period carries the flag. "Any" would let one
+         stray edit resurrect a period the aggregate never selected — and since
+         drop_incomplete_meter_periods() guarantees every surviving period has
+         all N meters, "all" is exactly the invariant the writer produces.
+
+      2. Overwriting "Selected_Baseline". optimize_from_locked() reads that
+         column and nothing else, so populating it here means that function
+         works on aggregates with no changes at all. The individual meters'
+         flags are meaningless for an aggregate row — meter A's own model may
+         have locked a period the aggregate didn't, and vice versa. That
+         conflation is precisely what the two-column split exists to prevent.
+
+      Left as None on the SEQUENTIAL path, where "Selected_Baseline" keeps its
+      per-meter "first" value: a sequential stitch is the site's INDIVIDUAL
+      model for that fuel (each period has exactly one meter), so it locks off
+      the individual column like any other meter.
+    """
     agg_cols = {"Consumption": "sum", "Total_Charges": "sum",
                 "Service_Type": "first", "Site_Name": "first"}
     for opt in ["HDD", "CDD", "Baseline_Bill", "Reporting_Bill",
-                "Commission_Date", "WeatherStation", "Weather_Source"]:
+            "Commission_Date", "WeatherStation", "Weather_Source",
+            "Selected_Baseline"]:
         if opt in site_data.columns:
             agg_cols[opt] = "first"
+
+    # Passing agg_lock_col at all is the caller declaring "this is an aggregate".
+    # Whether the column actually EXISTS in the data is a separate question, and
+    # the distinction matters: on a legacy single-column input there is no
+    # aggregate lock column, and the aggregate must then have NO locked baseline
+    # — it must NOT inherit the individual meters' flags that "first" would
+    # otherwise leave sitting in Selected_Baseline. Getting this wrong rebuilt
+    # URB002's aggregate from meter 5888384's 11 individually-locked periods
+    # (R2 0.5143) instead of the aggregate's own 12 (R2 0.8835), and silently
+    # flipped URB032 from Skipped to Locked. That is the same individual/
+    # aggregate conflation the two-column split exists to prevent.
+    is_aggregate = bool(agg_lock_col)
+    has_agg_lock = is_aggregate and agg_lock_col in site_data.columns
+    if has_agg_lock:
+        agg_cols[agg_lock_col] = lambda s: (
+            "1" if s.astype(str).str.strip().isin(("1", "1.0")).all() else "")
+
     agg_df = site_data.groupby(["Period_Start_Date", "Period_End_Date"],
                                as_index=False).agg(agg_cols)
     agg_df["Meter_Number"] = "AGGREGATED"
+
+    if is_aggregate:
+        if has_agg_lock:
+            agg_df["Selected_Baseline"] = agg_df[agg_lock_col]
+            agg_df = agg_df.drop(columns=[agg_lock_col])
+        else:
+            # No aggregate lock column in the input => this aggregate has no
+            # locked baseline and must be optimized fresh.
+            agg_df["Selected_Baseline"] = ""
+
     return agg_df
+
+
+def _meets_individual_baseline_count(meter_bills: pd.DataFrame, is_gas: bool,
+                                     baseline_count: int) -> bool:
+    """
+    True if this single meter's OWN baseline bills — after the same outlier
+    removal and missing-weather filtering optimize() applies before checking
+    against baseline_count — individually reach baseline_count (12 electric /
+    8 gas) clean bills.
+
+    Used to decide which meters are eligible to be pooled into a concurrent-
+    meter aggregate (see run_analysis): only meters that individually clear
+    this bar get aggregated together. A meter short on clean baseline bills
+    is excluded from the aggregate pool entirely, rather than being folded in
+    and dragging the aggregate's own usable baseline count down — e.g. two
+    meters that are billed on identical concurrent periods don't add up to
+    more available periods when pooled, they just sum consumption within the
+    periods that exist, so a short meter can pull a perfectly good aggregate
+    down to its own shortfall.
+
+    Deliberately count-only: a meter that has enough clean bills but still
+    fails to find a valid seasonal-balance/weather-coverage combination on
+    its own (i.e. its own optimize() call returns None for THAT reason) still
+    counts as qualifying here — combining it with another meter's bills may
+    well produce a fittable aggregate even though the meter alone couldn't.
+    Quality (R²/CV-RMSE/weather coverage) is intentionally not checked here
+    at all; that's assessed only after the aggregate itself is fit.
+
+    Mirrors but does not call optimize()'s internal raw_baseline /
+    detect_baseline_outliers / NaN-weather-drop sequence — kept as a
+    standalone, lighter-weight count check since this only needs a count,
+    not optimize()'s full bl_outliers record-building. If that filtering
+    logic in optimize() ever changes, this should be updated to match.
+    """
+    raw_baseline = meter_bills[meter_bills["Baseline_Bill"] == 1]
+    if len(raw_baseline) == 0:
+        return False
+    clean_baseline, _ = detect_baseline_outliers(raw_baseline)
+    weather_cols = ["HDD"] if is_gas else ["HDD", "CDD"]
+    clean_baseline = clean_baseline.dropna(subset=weather_cols)
+    return len(clean_baseline) >= baseline_count
 
 
 def calc_meter_weights(site_data: pd.DataFrame, meter_nums: list) -> dict:
@@ -701,6 +1426,14 @@ def build_result_row(res, site, meter_num, model_type, service_type,
                  else "Fair (Fail)"        if res["cvrmse"] <= 25 else "Poor")
     wc_rating = ("Excellent" if res["wc_overall"] >= 90 else "Good" if res["wc_overall"] >= 75
                  else "Fair" if res["wc_overall"] >= 60 else "Poor")
+    # Bands mirror the R2/weather-coverage style. Note the fuel-specific PASS
+    # threshold is 0.75 electric / 0.50 gas, so a "Fair" gas baseline still
+    # passes while a "Fair" electric one does not — the rating describes the
+    # number, "Passes Seasonal Balance" applies the fuel's gate.
+    _sb = res.get("seasonal_balance")
+    sb_rating = (None if _sb is None else
+                 "Excellent" if _sb >= 0.90 else "Good" if _sb >= 0.75
+                 else "Fair"  if _sb >= 0.50 else "Poor")
 
     return {
         "Site Name":               site,
@@ -708,7 +1441,20 @@ def build_result_row(res, site, meter_num, model_type, service_type,
         "Model Type":              model_type,
         "Service Type":            service_type,
         "Seasonal Strategy":       res["seasonal_strategy"],
-        "Optimization Mode":       "Locked" if res["seasonal_strategy"] == "Locked (pre-selected)" else "Optimized",
+        # Two INDEPENDENT facts, deliberately kept in separate columns:
+        #   Optimization Mode  — how THIS run arrived at the baseline
+        #                        (Optimized / Most Recent / Locked / Skipped)
+        #   Seasonal Strategy  — what the baseline IS, re-derived from the bills
+        # A most-recent-N baseline that gets saved and re-uploaded comes back as
+        # Optimization Mode = "Locked" (true — this run read it off the file)
+        # while Seasonal Strategy still reads "Most recent bills — no
+        # optimization" (also true, and re-derived rather than remembered). So
+        # the fact that a baseline was never optimized survives the round-trip
+        # instead of vanishing behind a bare "Locked".
+        # Set explicitly by each path rather than sniffed out of the strategy
+        # string, which cannot distinguish "locked" from "most recent" once a
+        # most-recent baseline has been locked.
+        "Optimization Mode":       res.get("optimization_mode", "Optimized"),
         "New Site":                res.get("is_new_site", False),
         "CV Ceiling Relaxed":      res.get("cv_ceiling_relaxed", False),
         "Baseline Count":          len(res["selected"]),
@@ -728,12 +1474,16 @@ def build_result_row(res, site, meter_num, model_type, service_type,
         "CDD Coverage (%)":        round(res["wc_cdd"], 1),
         "Weather Coverage Rating": wc_rating,
         "Passes Weather Coverage": res["passes_wc"],
+        "Seasonal Balance":        (None if res.get("seasonal_balance") is None
+                                    else round(res["seasonal_balance"], 2)),
+        "Seasonal Balance Rating": sb_rating,
+        "Passes Seasonal Balance": res.get("passes_seasonal"),
         "Model Passes Quality":    res["passes_all"],
-        "Q1 Bills":                res["Q1_Bills"],
-        "Q2 Bills":                res["Q2_Bills"],
-        "Q3 Bills":                res["Q3_Bills"],
-        "Q4 Bills":                res["Q4_Bills"],
-        "Temporal CV":             round(res["temporal_cv"], 1),
+        "Q1 Bills (Jan-Mar)": res["Q1_Bills"],
+        "Q2 Bills (Apr-Jun)": res["Q2_Bills"],
+        "Q3 Bills (Jul-Sep)": res["Q3_Bills"],
+        "Q4 Bills (Oct-Dec)": res["Q4_Bills"],
+        "Quarterly Spread (%)":             round(res["temporal_cv"], 1),
         "Total Avoided Usage":     round(res["total_avoided"], 2),
         "Pct Avoided Usage":       round(res["pct_avoided"], 2),
         "Notes":                   notes,
@@ -743,6 +1493,45 @@ def build_result_row(res, site, meter_num, model_type, service_type,
         "Coverage Flag":           "",
         **compute_cost_cols(res),
     }
+
+
+def build_skipped_model_row(site, meter_num, model_type, service_type, skip_reason):
+    """
+    Build an all_models-schema row for a site/meter where optimize()
+    or optimize_from_locked() returned None — i.e. no model could be fit at
+    all (insufficient baseline bills, no valid combination passed quality
+    gates, etc.). Without this, such sites previously vanished from every
+    output table with zero trace (see project discussion: AMD0701/702/703/706
+    had only ~11 clean baseline bills against a 12-bill requirement and were
+    silently dropped with no record anywhere).
+
+    All model-dependent columns (R2, CV-RMSE, equation, coefficients, cost
+    columns, etc.) are left None since no model exists to report on. Identity
+    columns (Site/Meter/Service/Model Type) are populated normally so the row
+    is filterable/sortable alongside real results, and Notes/Savings Status
+    carry the skip_reason so the cause is immediately visible without cross-
+    referencing the outliers table.
+    """
+    row = {col: None for col in SCHEMAS["model"]}
+    row.update({
+        "Site Name":            site,
+        "Meter Number":         str(meter_num),
+        "Model Type":           model_type,
+        "Service Type":         service_type,
+        "Seasonal Strategy":    "N/A — No Model Fit",
+        "Optimization Mode":    "Skipped",
+        "Baseline Count":       0,
+        "Reporting Count":      0,
+        "Model Passes Quality": False,
+        "Recommendation Reason": f"No model could be fit — {skip_reason}",
+        "Notes":                f"SKIPPED — {skip_reason}",
+        "Savings Status":       "Excluded — No Model Fit",
+        "Weight Flag":          "",
+        "Coverage Flag":        "",
+        "New Site":             None,
+        "CV Ceiling Relaxed":   None,
+    })
+    return row
 
 
 def compute_cost_cols(res: dict) -> dict:
@@ -777,20 +1566,19 @@ def compute_cost_cols(res: dict) -> dict:
     rate     = total_charges / total_cons
     per_pct  = (pred - rep_df["Consumption"].values) / pred
 
-    if bool((per_pct < 0).all()):
-        return {
-            "Measured Rate": None, "Modeled Cost ($)": None, "Actual Cost ($)": None,
-            "Avoided Cost ($)": 0.0, "Avg Monthly Avoided Cost": 0.0,
-            "Total Modeled Usage": None, "Total Actual Usage": None,
-            "Savings Status": "Excluded — All Reporting Periods Negative",
-            "Savings Exclusion Flag": (
-                f"EXCLUDED — All {n_bills} clean reporting bill(s) show negative savings "
-                f"(avg {per_pct.mean()*100:.1f}% avoided)"
-            ),
-        }
-
+    # Cost figures are ALWAYS calculated, whatever the savings verdict turns out
+    # to be. Previously an all-negative site returned nulls for Measured Rate /
+    # Modeled Cost / Actual Cost / Total Modeled Usage / Total Actual Usage and
+    # a hard-zero Avoided Cost, which left the analyst nothing to review — and
+    # was internally inconsistent, since Total Avoided Usage and Pct Avoided
+    # Usage were populated on those same rows. A site showing usage savings but
+    # blank cost savings is worse than either extreme. Savings Status is a LABEL
+    # the dashboard filters on; it is not a reason to withhold the numbers.
+    # (Note: reporting_bills already published per-bill Bill Avoided Cost on
+    # these rows, so this brings the model tables in line with what the bill
+    # tables were reporting all along.)
     avoided_cost = round(pred_sum * rate - total_charges, 2)
-    return {
+    row = {
         "Measured Rate":            round(rate, 4),
         "Modeled Cost ($)":         round(pred_sum * rate, 2),
         "Actual Cost ($)":          round(total_charges, 2),
@@ -801,6 +1589,20 @@ def compute_cost_cols(res: dict) -> dict:
         "Savings Status":           "Included",
         "Savings Exclusion Flag":   "",
     }
+
+    # Exclude only on a PATTERN of negative savings, not a single data point.
+    # One negative bill is the normal state of a brand-new customer whose first
+    # bill has just arrived; excluding on it would drop the site out of
+    # reporting entirely on one observation. See
+    # MIN_REPORTING_BILLS_FOR_NEGATIVE_EXCLUSION.
+    if (bool((per_pct < 0).all())
+            and n_bills >= MIN_REPORTING_BILLS_FOR_NEGATIVE_EXCLUSION):
+        row["Savings Status"] = "Excluded — All Reporting Periods Negative"
+        row["Savings Exclusion Flag"] = (
+            f"EXCLUDED — All {n_bills} clean reporting bill(s) show negative savings "
+            f"(avg {per_pct.mean()*100:.1f}% avoided)"
+        )
+    return row
 
 
 def build_bill_row(r, site, meter_num, service_type, period_type, status):
@@ -816,16 +1618,79 @@ def build_bill_row(r, site, meter_num, service_type, period_type, status):
         "Avoided Usage":         None,
         "Pct Avoided":           None,
         "Bill Avoided Cost":     None,
-        "Selected Baseline":     None,
+        # Split into two columns: an individual meter model and the site's
+        # aggregate model each select their own baseline, and a single flag
+        # can't represent both. See build_input_with_baseline.
+        "Individual Selected Baseline":  None,
+        "Aggregated Selected Baseline":  None,
         "Weather Source":        r.get("Weather_Source", r.get("Weather Source", "")),
     }
 
 
-def build_baseline_rows(res, site, meter_num, service_type):
+def build_skip_bill_rows(bill_data: pd.DataFrame, site, service_type, status: str) -> tuple:
+    """
+    Build bare baseline/reporting bill rows for bills that won't go through
+    any model (no model was fit, for whatever reason given in `status`).
+    All model-dependent fields (Predicted Consumption, Avoided Usage, Pct
+    Avoided, Bill Avoided Cost) are left None via build_bill_row's defaults —
+    only the raw bill data passes through.
+
+    Period Type / Baseline-vs-Reporting split is taken from the existing
+    Baseline_Bill / Reporting_Bill flags already computed by infer_flags(),
+    same as the normal path, so these still land in the correct output table.
+
+    Generalised from the original cost-only-specific version (see project
+    history) to also cover the "optimize() returned None" case — e.g.
+    insufficient baseline data — so those bills are likewise still visible
+    in baseline_bills/reporting_bills rather than vanishing with no trace.
+    `bill_data` can be a whole site (cost-only skip, site-level) or a single
+    meter's slice (no-model-fit skip, meter-level) — each row is labelled
+    with its own Meter_Number either way, so this works for both granularities.
+
+    Returns (baseline_rows, reporting_rows) — both lists of dicts in the
+    "bills" schema shape, ready to extend into baseline_bill_rows /
+    reporting_bill_rows directly.
+    """
+    baseline_rows, reporting_rows = [], []
+    for _, r in bill_data.iterrows():
+        meter_num = r.get("Meter_Number")
+        meter_num = "N/A" if (meter_num is None or (isinstance(meter_num, float) and np.isnan(meter_num))) else meter_num
+        row = build_bill_row(r, site, meter_num, service_type,
+                             "Baseline" if r.get("Baseline_Bill") == 1 else "Reporting",
+                             status)
+        if r.get("Baseline_Bill") == 1:
+            baseline_rows.append(row)
+        else:
+            reporting_rows.append(row)
+    return baseline_rows, reporting_rows
+
+
+def build_cost_only_skip_rows(site_data: pd.DataFrame, site, service_type) -> tuple:
+    """
+    Thin wrapper over build_skip_bill_rows with the cost-only-specific status
+    message, kept as its own named function since "cost-only skip" and
+    "no model fit" are conceptually different reasons even though they now
+    share the same row-building mechanics.
+    """
+    status = ("Excluded: Site skipped — more than one PUBLISHER bill found for "
+              "a billing period (cost-only consolidation could not be performed). "
+              "See cost_only_review table.")
+    return build_skip_bill_rows(site_data, site, service_type, status)
+
+
+def build_baseline_rows(res, site, meter_num, service_type, is_aggregate=False):
+    """
+    is_aggregate routes the "1" to the right column. Bill rows are already
+    split by meter — an aggregate emits its own "AGGREGATED (N)" rows — so a
+    given row belongs to exactly one model and there is no ambiguity here.
+    (input_with_baseline is the harder case: its rows are per-meter and BOTH
+    models want to mark the same row.)
+    """
+    col  = "Aggregated Selected Baseline" if is_aggregate else "Individual Selected Baseline"
     rows = []
     for _, r in res["selected"].iterrows():
         row = build_bill_row(r, site, meter_num, service_type, "Baseline", "Used in Model")
-        row["Selected Baseline"] = "1"
+        row[col] = "1"
         rows.append(row)
     for _, r in res.get("bl_outliers_df", pd.DataFrame()).iterrows():
         rows.append(build_bill_row(r, site, meter_num, service_type, "Baseline",
@@ -865,6 +1730,9 @@ def build_reporting_rows(res, site, meter_num, service_type, model_passes=None, 
                 "Passes R2":             res.get("passes_r2"),
                 "Passes CV-RMSE":        res.get("passes_cvrmse"),
                 "Passes Weather Coverage": res.get("passes_wc"),
+                "Seasonal Balance":       (None if res.get("seasonal_balance") is None
+                                           else round(res["seasonal_balance"], 2)),
+                "Passes Seasonal Balance": res.get("passes_seasonal"),
             })
             rows.append(row)
     return rows
@@ -884,6 +1752,22 @@ def build_outlier_row(o, site, meter_num, service_type):
         "Outlier Type":      o.get("Outlier_Type",   o.get("Outlier Type",   "")),
         "Outlier Reason":    o.get("Outlier_Reason", o.get("Outlier Reason", "")),
     }
+
+
+# build_skip_outlier_row() was removed here.
+#
+# It emitted a row into the outliers table whenever optimize() returned no model
+# — Outlier Type "Site Skipped", with Period dates / HDD / CDD / Consumption /
+# Total Charges all blank, because no individual bill was at fault. That made the
+# outliers table two things at once: a list of bad bills AND a list of skipped
+# sites. The table is now only the first.
+#
+# No information is lost. Every skip already surfaces in all_models via
+# build_skipped_model_row(), which carries the identical text in Notes
+# ("SKIPPED — {reason}") and in Recommendation Reason ("No model could be fit —
+# {reason}"). Filtering all_models on Optimization Mode = "Skipped" gives the
+# same list, with the site's full model context attached instead of eight blank
+# bill columns.
 
 
 def build_meter_weight_rows(site, service_type, meter_weights, ind_results,
@@ -932,54 +1816,542 @@ def build_notes(ind_results, agg_res, meter_count):
     return " | ".join(parts)
 
 
+def backfill_original_weather(df_original: pd.DataFrame,
+                              proc_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Copy the post-merge_weather() HDD/CDD back onto df_original.
+
+    WHY THIS EXISTS
+      In the 'Input' / 'Input_GEM' branches of _sigma_main(), df_original is
+      snapshotted inside preprocess() — BEFORE merge_weather() runs. Only
+      proc_df gets the Sigma-sourced HDD/CDD; df_original keeps whatever the
+      Input table's own HDD/CDD columns happened to hold. Since
+      input_with_baseline is built from df_original, that table has been
+      publishing weather values the models were never fitted on.
+
+      Measured on the 2026-07-13 run: of 1,080 rows that could be matched
+      between input_with_baseline and the bills tables, 1,059 (98.1%) had
+      different HDD/CDD — every one of them flagged Weather Source = 'Sigma'.
+      e.g. URB041 / 6906426 / 2026-05-06 was published as HDD 45.1 but the
+      model was actually fitted on HDD 49.1.
+
+      This matters twice over: input_with_baseline is meant to be an honest
+      record of the run, and it's meant to be saved and re-uploaded. Re-upload
+      it through the 'sigma' weather path and the wrong values are harmlessly
+      overwritten; re-upload it through the 'csv' path and the models silently
+      shift.
+
+    JOIN KEY
+      (Site_Name, Period_Start_Date, Period_End_Date) — the same triple
+      merge_weather() itself joins on. Deliberately NOT keyed on
+      Meter_Number: weather is a property of the site's billing window, every
+      meter at a site shares it, and Meter_Number is legitimately null in some
+      inputs (keying on it would reintroduce the null-meter join problems seen
+      elsewhere in this script). Period_End_Date is required in the key for
+      the same reason merge_weather needs it — electric and gas at one site
+      can share a Period_Start_Date but end on different days.
+
+    SCOPE
+      Overwrites HDD/CDD only where they already exist as columns on
+      df_original, and only where proc_df has a value. Does NOT add the
+      columns when the input lacks them, and does NOT copy the derived
+      'Weather Source' column across — both would change the shape of
+      input_with_baseline, which is a separate decision.
+
+    No-op for the 'Uploaded File' branch, which never calls merge_weather()
+    and therefore has nothing to backfill.
+    """
+    if df_original is None or len(df_original) == 0 or proc_df is None:
+        return df_original
+
+    # df_original keeps the input's ORIGINAL header text ("Site Name",
+    # "Period_Start_Date", ...), so resolve columns the same fuzzy way
+    # build_input_with_baseline does rather than assuming the renamed form.
+    _sc = next((c for c in df_original.columns
+                if c.lower().replace("_", " ") == "site name"), None)
+    _ps = next((c for c in df_original.columns
+                if "start" in c.lower() and "period" in c.lower()), None)
+    _pe = next((c for c in df_original.columns
+                if "end" in c.lower() and "period" in c.lower()), None)
+    _hd = next((c for c in df_original.columns if c.strip().upper() == "HDD"), None)
+    _cd = next((c for c in df_original.columns if c.strip().upper() == "CDD"), None)
+
+    needed = {"Site_Name", "Period_Start_Date", "Period_End_Date", "HDD", "CDD"}
+    if not (_sc and _ps and _pe) or not (_hd or _cd) or not needed.issubset(proc_df.columns):
+        return df_original
+
+    out = df_original.copy()
+    key = ["_bf_site", "_bf_ps", "_bf_pe"]
+
+    # Both sides MUST go through the same normalisation preprocess() applies at
+    # the top of the script (to_datetime(utc=True) -> tz_convert(None)).
+    # df_original is a snapshot taken BEFORE that normalisation runs, so when
+    # the input arrives from Snowflake its dates are tz-aware (datetime64[ns,
+    # UTC]) while proc_df's have already been flattened to naive. Merging one
+    # against the other raises:
+    #   "You are trying to merge on datetime64[ns, UTC] and datetime64[ns]
+    #    columns for key '_bf_ps'"
+    # A plain to_datetime() is NOT enough — it preserves whatever tz is already
+    # there. Round-tripping through utc=True makes naive and aware inputs land
+    # on the same naive values either way.
+    def _naive(s):
+        return pd.to_datetime(s, errors="coerce", utc=True).dt.tz_convert(None)
+
+    out["_bf_site"] = out[_sc].astype(str)
+    out["_bf_ps"]   = _naive(out[_ps])
+    out["_bf_pe"]   = _naive(out[_pe])
+
+    # One weather row per (site, period). merge_weather already guarantees
+    # uniqueness on this triple; drop_duplicates is belt-and-braces so a stray
+    # duplicate can never fan the left join out and multiply input rows.
+    lut = proc_df[list(needed)].copy()
+    lut["_bf_site"] = lut["Site_Name"].astype(str)
+    lut["_bf_ps"]   = _naive(lut["Period_Start_Date"])
+    lut["_bf_pe"]   = _naive(lut["Period_End_Date"])
+    lut = (lut.drop_duplicates(subset=key)[key + ["HDD", "CDD"]]
+              .rename(columns={"HDD": "_bf_hdd", "CDD": "_bf_cdd"}))
+
+    # Cheap insurance against this whole class of failure recurring silently.
+    for c in ("_bf_ps", "_bf_pe"):
+        assert out[c].dtype == lut[c].dtype, (
+            f"backfill_original_weather: join key {c} dtype mismatch "
+            f"({out[c].dtype} vs {lut[c].dtype})")
+
+    n_before = len(out)
+    out = out.merge(lut, on=key, how="left")
+    assert len(out) == n_before, (
+        "backfill_original_weather fanned out the input — the weather lookup "
+        "is not unique on (Site_Name, Period_Start_Date, Period_End_Date)")
+
+    changed = 0
+    for src, dst in ((("_bf_hdd"), _hd), (("_bf_cdd"), _cd)):
+        if not dst:
+            continue
+        upd = out[src].notna()
+        changed += int((pd.to_numeric(out.loc[upd, dst], errors="coerce")
+                        != out.loc[upd, src]).sum())
+        out.loc[upd, dst] = out.loc[upd, src]
+
+    out = out.drop(columns=key + ["_bf_hdd", "_bf_cdd"])
+    if changed:
+        print(f"[INFO] input_with_baseline: corrected HDD/CDD on {changed} value(s) "
+              f"to the enriched weather the models were actually fitted on.")
+    return out
+
+
 # ── input_with_baseline builder ───────────────────────────────────────────────
 
-def build_input_with_baseline(df_original, selected_baseline_keys):
+def build_input_with_baseline(df_original, selected_baseline_keys,
+                              cost_only_flagged_sites=None,
+                              aggregated_baseline_keys=None):
     """
-    Returns df_original with a clean Selected Baseline column stamped.
+    Returns df_original with clean Individual/Aggregated Selected Baseline
+    columns stamped.
     Existing "1" values in the input are preserved; new selections from
     this run are added. Blank/NaN entries become "".
+
+    Sites that consolidated cleanly during cost-only processing (i.e. are
+    NOT in cost_only_flagged_sites) are also consolidated HERE — PUBLISHER
+    + PASS_THROUGH combined into one row, Consumption taken from PUBLISHER
+    only, Total Charges summed — mirroring exactly what optimization ran
+    against, so a corrected re-upload doesn't have to redo that math.
+    Flagged sites are deliberately left split/untouched, exactly as
+    uploaded, since they're the ones the user still needs to review and
+    correct in this exported file before re-running.
     """
+    cost_only_flagged_sites  = cost_only_flagged_sites or set()
+    aggregated_baseline_keys = aggregated_baseline_keys or set()
     iwb = df_original.copy()
 
     _sc = next((c for c in iwb.columns if c.lower().replace("_", " ") == "site name"), None)
     _mc = next((c for c in iwb.columns if "meter" in c.lower()), None)
     _pc = next((c for c in iwb.columns if "start" in c.lower() and "period" in c.lower()), None)
 
-    # Capture existing Selected Baseline values BEFORE dropping the column,
-    # so re-upload files don't lose previously locked baseline marks.
-    existing_sb_col = next(
-        (c for c in iwb.columns if c.lower().replace(" ", "_") == "selected_baseline"), None
-    )
-    existing_sb = {}
-    if existing_sb_col and _sc and _pc:
-        for _, r in iwb.iterrows():
-            if str(r.get(existing_sb_col, "")).strip() in ("1", "1.0"):
-                sv = str(r.get(_sc, ""))
-                pv = str(pd.to_datetime(r.get(_pc, ""), errors="coerce").date())
-                mv = str(r.get(_mc, "")) if _mc else ""
-                existing_sb[(sv, mv, pv)] = "1"
+    # ── Cost-only (PUBLISHER/PASS_THROUGH) consolidation for display ───────
+    # Reuses consolidate_cost_only_bills() itself (rather than duplicating
+    # its grouping logic) by temporarily renaming the columns it needs onto
+    # df_original's own header text, then renaming the result back. The SET
+    # of flagged sites is always taken from the caller — already computed
+    # once, authoritatively, in preprocess() — never recomputed here, so
+    # there's no risk of a second, possibly-divergent flagging decision;
+    # this block only ever uses its own local run for the merged Total
+    # Charges values on the non-flagged side.
+    _pend = next((c for c in iwb.columns if "end" in c.lower() and "period" in c.lower()), None)
+    _svc  = next((c for c in iwb.columns if c.lower().replace("_", " ") == "service type"), None)
+    _chg  = next((c for c in iwb.columns if "charge" in c.lower()), None)
+    _cls  = next((c for c in iwb.columns
+                  if c.lower().replace(" ", "_") == COST_ONLY_CLASSIFICATION_COL.lower()), None)
+
+    if _sc and _mc and _pc and _pend and _svc and _chg and _cls:
+        _rename = {_sc: "Site_Name", _mc: "Meter_Number", _pc: "Period_Start_Date",
+                   _pend: "Period_End_Date", _svc: "Service_Type", _chg: "Total_Charges",
+                   _cls: COST_ONLY_CLASSIFICATION_COL}
+        _unrename = {v: k for k, v in _rename.items()}
+
+        _tmp = iwb.rename(columns=_rename)
+        _tmp["Total_Charges"] = pd.to_numeric(
+            _tmp["Total_Charges"].astype(str).str.replace(r"[\$,]", "", regex=True).str.strip(),
+            errors="coerce")
+        _consolidated, _ = consolidate_cost_only_bills(_tmp)
+        # Belt-and-suspenders: regardless of what this local run decided,
+        # never let a flagged site come through consolidated, and always
+        # bring every flagged site's original rows back in untouched.
+        _consolidated = _consolidated[~_consolidated["Site_Name"].isin(cost_only_flagged_sites)]
+        _flagged_raw  = _tmp[_tmp["Site_Name"].isin(cost_only_flagged_sites)]
+        iwb = pd.concat([_consolidated, _flagged_raw], ignore_index=True).rename(columns=_unrename)
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── Preserve any "1"s already in the uploaded file ─────────────────────
+    # Captured BEFORE the columns are dropped and rebuilt, so a re-uploaded
+    # file doesn't lose locks from earlier runs. Legacy single-column files map
+    # onto the individual side (see preprocess for why that's the right read).
+    def _find_sb_col(*wanted):
+        for w in wanted:
+            hit = next((c for c in iwb.columns
+                        if c.lower().replace(" ", "_") == w), None)
+            if hit:
+                return hit
+        return None
+
+    ind_col = _find_sb_col("individual_selected_baseline", "selected_baseline")
+    agg_col = _find_sb_col("aggregated_selected_baseline")
+
+    def _existing(col):
+        found = {}
+        if col and _sc and _pc:
+            for _, r in iwb.iterrows():
+                if str(r.get(col, "")).strip() in ("1", "1.0"):
+                    sv = str(r.get(_sc, ""))
+                    pv = str(pd.to_datetime(r.get(_pc, ""), errors="coerce").date())
+                    mv = str(r.get(_mc, "")) if _mc else ""
+                    found[(sv, mv, pv)] = "1"
+        return found
+
+    existing_ind = _existing(ind_col)
+    existing_agg = _existing(agg_col)
 
     iwb = iwb.drop(columns=[c for c in iwb.columns
-                             if c.lower().replace(" ", "_") == "selected_baseline"])
-    iwb["Selected Baseline"] = ""
+                            if c.lower().replace(" ", "_") in
+                            ("selected_baseline", "individual_selected_baseline",
+                             "aggregated_selected_baseline")])
+    iwb[IND_SB_COL] = ""
+    iwb[AGG_SB_COL] = ""
 
     if _sc and _pc:
-        def _mark(r):
-            sv  = str(r.get(_sc, ""))
+        # Both models want to mark the SAME row: one row is one meter's bill for
+        # one period, and a period can be in a meter's own baseline, the site
+        # aggregate's baseline, both, or neither. Two independent columns, each
+        # answering its own question, is the only representation that survives a
+        # round-trip. Writing both into one column is what inflated meters'
+        # locked baselines on re-upload.
+        def _keys_for(r):
+            sv = str(r.get(_sc, ""))
             mv_raw = r.get(_mc, "") if _mc else ""
             # Normalise blank/NaN meter to "N/A" — matches how meter_iter labels no-meter sites
-            mv  = "N/A" if (mv_raw is None or str(mv_raw).strip() in ("", "nan", "NaN"))\
-                  else str(mv_raw)
-            pv  = str(pd.to_datetime(r.get(_pc, ""), errors="coerce").date())
-            if (sv, mv, pv) in selected_baseline_keys:           return "1"
-            if (sv, "AGGREGATED", pv) in selected_baseline_keys: return "1"
-            if existing_sb.get((sv, mv, pv)) == "1":             return "1"
-            return ""
-        iwb["Selected Baseline"] = iwb.apply(_mark, axis=1)
+            mv = "N/A" if (mv_raw is None or str(mv_raw).strip() in ("", "nan", "NaN"))\
+                 else str(mv_raw)
+            pv = str(pd.to_datetime(r.get(_pc, ""), errors="coerce").date())
+            return (sv, mv, pv)
 
-    orig_cols = [c for c in df_original.columns if c != "Selected Baseline" and c in iwb.columns]
-    return iwb[orig_cols + ["Selected Baseline"]]
+        def _mark_ind(r):
+            k = _keys_for(r)
+            return "1" if (k in selected_baseline_keys or existing_ind.get(k) == "1") else ""
+
+        def _mark_agg(r):
+            k = _keys_for(r)
+            return "1" if (k in aggregated_baseline_keys or existing_agg.get(k) == "1") else ""
+
+        iwb[IND_SB_COL] = iwb.apply(_mark_ind, axis=1)
+        iwb[AGG_SB_COL] = iwb.apply(_mark_agg, axis=1)
+
+    orig_cols = [c for c in df_original.columns
+                 if c.lower().replace(" ", "_") not in
+                 ("selected_baseline", "individual_selected_baseline",
+                  "aggregated_selected_baseline")
+                 and c in iwb.columns]
+    return iwb[orig_cols + [IND_SB_COL, AGG_SB_COL]]
+
+
+# ── cost_only_review builder ──────────────────────────────────────────────────
+
+def _compute_consolidated_sites(df_original, cost_only_flagged_sites) -> dict:
+    """
+    Identify sites that had PASS_THROUGH rows and were consolidated
+    successfully (i.e. NOT flagged). Returns {site_name: pass_through_count}.
+    Empty dict if the classification column isn't present.
+    """
+    cost_only_flagged_sites = cost_only_flagged_sites or set()
+    # Find the Provider Classification column using original (pre-rename) names.
+    cls_col = next(
+        (c for c in df_original.columns
+         if c.lower().replace(" ", "_") == COST_ONLY_CLASSIFICATION_COL.lower()),
+        None)
+    if cls_col is None:
+        return {}
+    pt_rows = df_original[df_original[cls_col] == PASS_THROUGH_LABEL]
+    if len(pt_rows) == 0:
+        return {}
+    site_col = next(
+        (c for c in df_original.columns
+         if c.lower().replace("_", " ") == "site name"), None)
+    if site_col is None:
+        return {}
+    pt_counts = pt_rows.groupby(site_col).size().to_dict()
+    return {s: ct for s, ct in pt_counts.items()
+            if s not in cost_only_flagged_sites}
+
+
+def build_cost_only_review_rows(flagged_sites,
+                                consolidated_sites=None) -> list:
+    """
+    Build the cost_only_review output table showing BOTH:
+      - successfully-consolidated sites (clean 1:1 PUBLISHER/PASS_THROUGH
+        matches that were merged automatically), AND
+      - flagged sites (sites skipped entirely from optimization because
+        automated consolidation could not be performed safely).
+
+    consolidated_sites is a dict of {site_name: pass_through_row_count} for
+    every site where PASS_THROUGH rows were merged cleanly. It defaults to
+    an empty dict when no cost-only classification column is present.
+
+    Both are shown in the same table so the user can see the full picture of
+    what happened during cost-only processing in one place, rather than
+    having to infer "why did 100 rows disappear from input_with_baseline?"
+    by cross-referencing input row counts against the flagged list.
+    """
+    consolidated_sites = consolidated_sites or {}
+    rows = []
+
+    # ── Successes: clean 1:1 consolidations ────────────────────────────────
+    for s in sorted(consolidated_sites):
+        pt_count = consolidated_sites[s]
+        rows.append({
+            "Site Name":       s,
+            "Issue Type":      "Successfully consolidated",
+            "Action Required": "No — consolidation completed automatically",
+            "Notes": (
+                f"Site '{s}' had {pt_count} PASS_THROUGH bill(s) that were "
+                f"each matched 1:1 with a PUBLISHER bill for the same billing "
+                f"period. Charges were summed (PUBLISHER + PASS_THROUGH); "
+                f"Consumption was taken from the PUBLISHER row only. "
+                f"{pt_count} PASS_THROUGH row(s) were merged and removed "
+                f"from input_with_baseline."
+            ),
+        })
+
+    # ── Failures: sites that couldn't be consolidated ──────────────────────
+    for s in sorted(flagged_sites):
+        rows.append({
+            "Site Name":       s,
+            "Issue Type":      "Cost-only consolidation could not be performed automatically",
+            "Action Required": "Yes — site excluded from analysis until source data corrected",
+            "Notes": (
+                f"Site '{s}' has at least one billing period (Site/Meter/Service/Period "
+                f"group) with either more than one PUBLISHER bill, or a PASS_THROUGH "
+                f"bill with no matching PUBLISHER bill. Automated PUBLISHER/PASS_THROUGH "
+                f"consolidation cannot be performed safely, so this site was skipped "
+                f"entirely from optimization and savings calculations. Review the source "
+                f"data so each billing period has exactly one PUBLISHER bill (and at most "
+                f"one matching PASS_THROUGH bill), then re-run."
+            ),
+        })
+
+    return rows
+
+
+# ── Site Meter Key / Recommended (KPI rollup support) ──────────────────────────
+
+def _recommendation_reason(r, agg_preferred_here):
+    """
+    Why is this row not Recommended?
+
+    States the STATISTICAL defect, never the method. A most-recent-N baseline is
+    not disqualified for being most-recent — that rung is the RESPONSE to a
+    problem, not the problem. The problem is whatever is actually wrong with the
+    data: usually a season the site has no bills for, sometimes weather coverage,
+    sometimes the fit itself. Those are the facts an analyst needs in order to
+    overrule the tool, and "we used your last 12 bills" is not one of them (it
+    lives in Optimization Mode / Seasonal Strategy as a neutral statement of
+    method).
+
+    Causes are joined rather than ranked: a baseline that is both seasonally
+    lopsided AND a poor fit is a different animal from one that fits beautifully
+    on unrepresentative data, and picking a single "primary" cause would hide
+    exactly the distinction that decides whether the model is salvageable.
+    """
+    if r.get("Recommended"):
+        return RECOMMENDED_NO_REASON
+
+    reasons = []
+
+    # Not a defect — a de-duplication choice. Stated first because it explains
+    # the row without implying anything is wrong with it.
+    if agg_preferred_here and r.get("Model Type") == "Individual":
+        reasons.append("Aggregate model preferred for this site/fuel "
+                       "(this meter's load is already counted in the aggregate)")
+
+    is_gas    = _is_gas(str(r.get("Service Type", "")))
+    r2_thresh = GAS_R2_THRESHOLD if is_gas else ELEC_R2_THRESHOLD
+    bal_thr   = GAS_SEASONAL_BALANCE_THRESHOLD if is_gas else SEASONAL_BALANCE_THRESHOLD
+
+    def _failed(col):
+        v = r.get(col)
+        return v is False or v == 0 or str(v).lower() == "false"
+
+    if _failed("Passes Seasonal Balance"):
+        # Read the counts off the renamed columns and the balance off the column
+        # that now carries it, rather than recomputing. (An earlier version read
+        # "Q1 Bills" etc.; when those were renamed to carry their month ranges,
+        # the lookup silently returned None and the detail vanished from the
+        # reason string, leaving a bare "not seasonally balanced" with nothing to
+        # check it against — the exact problem this column set exists to fix.)
+        _QCOLS = ["Q1 Bills (Jan-Mar)", "Q2 Bills (Apr-Jun)",
+                  "Q3 Bills (Jul-Sep)", "Q4 Bills (Oct-Dec)"]
+        q   = [r.get(c) for c in _QCOLS]
+        bal = r.get("Seasonal Balance")
+        if all(v is not None for v in q) and bal is not None:
+            reasons.append(
+                f"Baseline is not seasonally balanced — Q1-Q4 bills "
+                f"{q[0]}/{q[1]}/{q[2]}/{q[3]}, balance {bal:.2f} against a "
+                f"{bal_thr:.2f} minimum")
+        else:
+            reasons.append("Baseline is not seasonally balanced")
+
+    if _failed("Passes Weather Coverage"):
+        reasons.append(
+            f"Baseline spans only {r.get('Weather Coverage (%)')}% of the "
+            f"{'HDD' if is_gas else 'HDD/CDD'} range it must predict over "
+            f"({WEATHER_COVERAGE_THRESHOLD}% minimum)")
+
+    if _failed("Passes R2"):
+        reasons.append(f"R2 {r.get('R2')} below the {r2_thresh} minimum")
+
+    if _failed("Passes CV-RMSE"):
+        reasons.append(f"CV-RMSE {r.get('CV-RMSE')} above the {CVRMSE_THRESHOLD} maximum")
+
+    # A non-recommended row with no identified cause should not exist, but must
+    # never come back blank if it does — blank means "recommended" everywhere
+    # else in this column, so an unexplained False would read as its own opposite.
+    # Reached when every Passes_* flag is NaN rather than False (a row with no
+    # model at all), which _failed() cannot detect since NaN is not False.
+    return " | ".join(reasons) if reasons else "Not recommended — reason unavailable"
+
+
+def _apply_site_meter_key_and_recommended(all_model_rows, aggregated_rows,
+                                          baseline_bill_rows, reporting_bill_rows):
+    """
+    Stamps two columns onto every row across all_models,
+    aggregated_models, baseline_bills, and reporting_bills, to support
+    building KPI tiles that don't double-count a site whose meters were
+    BOTH modeled individually AND aggregated together.
+
+    "Site Meter Key" — "{Site Name} | {Meter Number} | {Service Type}",
+        concatenated. Lets a single Sigma control/filter built on this one
+        column drive which meter/aggregate rows count toward site-level KPI
+        rollups, rather than needing compound multi-column filter logic.
+        This is the column the user filters/selects on manually.
+
+    "Recommended" — a STARTING SUGGESTION for that manual selection only;
+        nothing else in this script reads or enforces it. Per (Site Name,
+        Service Type) group: if a passing Aggregated model exists, only
+        that aggregate row is marked Recommended (its component Individual
+        meters are not, since their load is already represented in the
+        aggregate). If no Aggregated model exists, or the aggregate exists
+        but doesn't pass quality, each Individual meter is marked
+        Recommended exactly when its OWN model passes quality. Skipped /
+        no-model rows are never Recommended. Sites with no model at all
+        (e.g. cost-only-flagged, or no row matched) default to False.
+
+    Mutates the four row-list arguments in place (each a list of dicts).
+    Returns None.
+    """
+    def _key(site, meter, service):
+        return f"{site} | {meter} | {service}"
+
+    model_rows = all_model_rows + aggregated_rows
+
+    # ── Stamp keys, and find which (Site, Service Type) groups have a
+    # passing Aggregated model ──────────────────────────────────────────────
+    passing_agg_groups = set()
+    for r in model_rows:
+        r["Site Meter Key"] = _key(r.get("Site Name"), r.get("Meter Number"), r.get("Service Type"))
+        if r.get("Model Type") == "Aggregated" and bool(r.get("Model Passes Quality")):
+            passing_agg_groups.add((r.get("Site Name"), r.get("Service Type")))
+
+    # ── Decide Recommended per model row using that group lookup ───────────
+    for r in model_rows:
+        group = (r.get("Site Name"), r.get("Service Type"))
+        if group in passing_agg_groups:
+            r["Recommended"] = (r.get("Model Type") == "Aggregated")
+        else:
+            r["Recommended"] = bool(r.get("Model Passes Quality"))
+
+    # ── Explain every False ────────────────────────────────────────────────
+    # Recommended = False now has four distinct causes (aggregate preferred,
+    # unrepresentative baseline, poor fit, no model at all), and a bare False
+    # can't tell an analyst which. Skip rows already carry their specific cause,
+    # set at construction in build_skipped_model_row(), so don't overwrite it.
+    for r in model_rows:
+        if r.get("Recommendation Reason"):
+            continue
+        r["Recommendation Reason"] = _recommendation_reason(
+            r, (r.get("Site Name"), r.get("Service Type")) in passing_agg_groups)
+
+    # ── Propagate onto bill rows by (Site Name, Meter Number, Service Type) ─
+    recommended_lookup = {
+        (r.get("Site Name"), r.get("Meter Number"), r.get("Service Type")):
+            (r["Recommended"], r.get("Recommendation Reason", ""))
+        for r in model_rows
+    }
+    # Bill rows for a SKIPPED aggregate are labelled just "AGGREGATED", while the
+    # model row that explains them says "AGGREGATED (2)" — the meter count is only
+    # known once aggregation succeeds. The exact-key lookup therefore missed them
+    # and they fell to the (False, "") default: not recommended, and no reason,
+    # despite build_skipped_model_row() having set a perfectly good one on the
+    # model row. Two URB039 rows landed in that hole. Same label-resolution
+    # problem as the aggregate baseline write-back, in a different lookup.
+    # aggregate_site() stamps Meter_Number = "AGGREGATED" on every row it builds,
+    # so bill rows can carry that literal while the model row explaining them is
+    # labelled something else entirely. Two different mismatches:
+    #   CONCURRENT — model says "AGGREGATED (2)"; the meter count isn't known
+    #                until aggregation succeeds, so a SKIPPED aggregate's bills
+    #                say plain "AGGREGATED".
+    #   SEQUENTIAL — not an aggregate at all, just two meters stitched into one
+    #                timeline, so the model row is labelled with the concatenated
+    #                meter numbers ("259000-068322, 259000-107067") while its
+    #                bills still say "AGGREGATED".
+    # Either way the exact-key lookup misses and the row falls to the default,
+    # losing a reason its model row already has. URB039 hit the sequential case.
+    by_site_svc = {}
+    for (st, mt, sv), val in recommended_lookup.items():
+        by_site_svc.setdefault((st, sv), []).append((mt, val))
+
+    def _resolve(site, meter, svc):
+        hit = recommended_lookup.get((site, meter, svc))
+        if hit is not None:
+            return hit
+        if not str(meter).startswith("AGGREGATED"):
+            return None
+        cands = by_site_svc.get((site, svc), [])
+        # Prefer a real aggregate model row when one exists (concurrent case).
+        agg = [v for m, v in cands if str(m).startswith("AGGREGATED")]
+        if len(agg) == 1:
+            return agg[0]
+        # Otherwise accept the site/fuel's model only if it is UNAMBIGUOUS — one
+        # model row means one thing these bills can belong to (sequential case).
+        # Never guess when several models share a site/fuel.
+        if len(cands) == 1:
+            return cands[0][1]
+        return None
+
+    for bill_list in (baseline_bill_rows, reporting_bill_rows):
+        for r in bill_list:
+            site, meter, svc = r.get("Site Name"), r.get("Meter Number"), r.get("Service Type")
+            hit = _resolve(site, meter, svc)
+            rec, reason = hit if hit is not None else (False, "Not recommended — reason unavailable")
+            r["Site Meter Key"] = _key(site, meter, svc)
+            r["Recommended"] = rec
+            r["Recommendation Reason"] = reason
 
 
 # ── Main analysis ─────────────────────────────────────────────────────────────
@@ -987,19 +2359,39 @@ def build_input_with_baseline(df_original, selected_baseline_keys):
 def run_analysis(df: pd.DataFrame,
                  already_preprocessed: bool = False,
                  df_original: pd.DataFrame = None,
-                 has_locked: bool = None) -> dict:
+                 has_locked: bool = None,
+                 cost_only_flagged_sites: set = None) -> dict:
     if already_preprocessed:
         # Caller (Sigma weather path) has already run preprocess() and
-        # merge_weather(); df_original and has_locked are passed in directly.
+        # merge_weather(); df_original, has_locked, and cost_only_flagged_sites
+        # are passed in directly since preprocess() ran before merge_weather().
         df = infer_flags(df)
+        cost_only_flagged_sites = cost_only_flagged_sites or set()
     else:
-        df, df_original, has_locked = preprocess(df)
+        df, df_original, has_locked, cost_only_flagged_sites = preprocess(df)
         df = infer_flags(df)
 
-    individual_rows, aggregated_rows        = [], []
+    all_model_rows, aggregated_rows        = [], []
     baseline_bill_rows, reporting_bill_rows = [], []
     outlier_rows, meter_weight_rows         = [], []
     selected_baseline_keys                  = set()
+    # Aggregate selections are kept in their OWN set and written to their OWN
+    # column. Previously they were added to selected_baseline_keys alongside
+    # the per-meter models' picks, so on write-out a meter's row got a "1" if
+    # EITHER its own model or the site's aggregate had chosen that period.
+    # Re-uploading that file then locked the meter onto the union: URB002's
+    # 5888384 re-fitted on 21 bills instead of the 18 its model actually used,
+    # URB009's 256000-216852 on 17 instead of 13 (R2 0.75 -> 0.41). One column
+    # cannot hold two models' selections.
+    aggregated_baseline_keys                = set()
+
+    # Sites with more than one PUBLISHER bill in any period group (see
+    # consolidate_cost_only_bills) are skipped entirely from optimization
+    # below — they still get bare bill rows in baseline_bills/reporting_bills
+    # (built directly from raw data, no model) so the bills themselves remain
+    # visible, but Selected Baseline stays blank for them in
+    # input_with_baseline since they never enter selected_baseline_keys.
+    cost_only_flagged_sites = cost_only_flagged_sites or set()
 
     # ── Exclude sites with no weather data from either source ─────────────────
     # A site is excluded if every one of its rows has NaN for both HDD and CDD.
@@ -1028,8 +2420,54 @@ def run_analysis(df: pd.DataFrame,
             df = df[~df["Site_Name"].isin(fully_excluded)].copy()
     # ──────────────────────────────────────────────────────────────────────────
 
-    for service_type in df["Service_Type"].dropna().unique():
-        is_gas      = _is_gas(service_type)
+    if cost_only_flagged_sites:
+        print(
+            f"\n[WARNING] The following {len(cost_only_flagged_sites)} site(s) could "
+            f"not have their PUBLISHER/PASS_THROUGH bills automatically consolidated "
+            f"(a billing period had more than one PUBLISHER bill, or a PASS_THROUGH "
+            f"bill with no matching PUBLISHER bill). They will be SKIPPED from "
+            f"optimization and savings calculations. See the 'cost_only_review' "
+            f"output table for details — these require manual review/correction of "
+            f"the source data before re-running:\n"
+            + "\n".join(f"  - {s}" for s in sorted(cost_only_flagged_sites))
+            + "\n"
+        )
+
+    # ── Locked-baseline summary ─────────────────────────────────────────────
+    # has_locked (file-wide: "does ANY row anywhere have Selected_Baseline=='1'")
+    # no longer drives the optimize_from_locked() vs optimize() routing decision
+    # below — that's now made per meter/site (see the meter_is_locked check
+    # further down), so a single locked site can no longer cause every other
+    # site in the file to be wrongly skipped. has_locked is kept purely as an
+    # informational summary here so a re-run's console output makes the mix
+    # of locked-vs-fresh sites visible at a glance.
+    if has_locked and "Selected_Baseline" in df.columns:
+        locked_sites = sorted(
+            df.loc[df["Selected_Baseline"] == "1", "Site_Name"].dropna().unique()
+        )
+        print(
+            f"\n[INFO] {len(locked_sites)} site(s) have a locked baseline "
+            f"(Selected Baseline = 1) and will be reconstructed from those "
+            f"locked bills rather than re-optimized:\n"
+            + "\n".join(f"  - {s}" for s in locked_sites)
+            + "\nAll other sites in this file will be optimized fresh.\n"
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Iterate over canonical service categories (gas vs electric), not raw
+    # string values. Multiple raw spellings that collapse to the same
+    # category via the "gas"/"elec" substring match (e.g. "Electric" and
+    # "Electricity") must only be processed ONCE per run — looping over
+    # df["Service_Type"].unique() directly reprocesses the entire
+    # substring-matched category once per raw spelling, producing exact
+    # duplicate rows in every output table for that category.
+    seen_categories = set()
+    for raw_service_type in df["Service_Type"].dropna().unique():
+        is_gas = _is_gas(raw_service_type)
+        if is_gas in seen_categories:
+            continue
+        seen_categories.add(is_gas)
+
         svc_df      = df[df["Service_Type"].str.lower().str.contains(
                           "gas" if is_gas else "elec", na=False)].copy()
         bl_count    = GAS_BASELINE_COUNT if is_gas else ELEC_BASELINE_COUNT
@@ -1038,6 +2476,23 @@ def run_analysis(df: pd.DataFrame,
 
         for site in sorted(svc_df["Site_Name"].dropna().unique()):
             site_data   = svc_df[svc_df["Site_Name"] == site].copy()
+
+            # ── Cost-only skip: site has more than one PUBLISHER bill for a
+            # billing period (see cost_only_review table). Skip entirely from
+            # optimization — don't fit any models, don't select any baseline
+            # bills — but still surface the raw bills themselves in
+            # baseline_bills/reporting_bills so the data isn't simply
+            # invisible to the user. selected_baseline_keys is intentionally
+            # NOT updated here, so input_with_baseline correctly leaves
+            # Selected Baseline blank for this site.
+            if site in cost_only_flagged_sites:
+                skip_bl_rows, skip_rep_rows = build_cost_only_skip_rows(
+                    site_data, site, display_svc)
+                baseline_bill_rows  += skip_bl_rows
+                reporting_bill_rows += skip_rep_rows
+                continue
+            # ─────────────────────────────────────────────────────────────
+
             meter_nums  = [m for m in site_data["Meter_Number"].dropna().unique()]
             meter_count = len(meter_nums)
             concurrent  = meters_concurrent(site_data) if meter_count > 1 else False
@@ -1056,19 +2511,59 @@ def run_analysis(df: pd.DataFrame,
             for meter_num, meter_data in meter_iter:
                 sequential = not concurrent and meter_count > 1
 
-                if has_locked:
-                    res, bl_out, rep_out = optimize_from_locked(
+                # Locking is decided per meter/site, not file-wide. A re-uploaded
+                # file will commonly contain a MIX of sites that already have a
+                # locked baseline (manually reviewed/corrected) and sites that
+                # still need a fresh optimization pass. The old file-wide
+                # has_locked flag routed EVERY site through optimize_from_locked()
+                # the moment any single site had a "1" anywhere — sites with no
+                # locked rows of their own then found nothing to reconstruct from
+                # and were skipped entirely, instead of falling through to a
+                # fresh optimize() run. See project discussion 2026-06: this is
+                # the exact failure mode hit when re-uploading input_with_baseline
+                # after only some sites had been manually reviewed.
+                meter_is_locked = (
+                    "Selected_Baseline" in meter_data.columns
+                    and (meter_data["Selected_Baseline"] == "1").any()
+                )
+                if meter_is_locked:
+                    res, bl_out, rep_out, skip_reason = optimize_from_locked(
                         f"{site}__{meter_num}", display_svc, meter_data, r2_thresh)
                 else:
-                    res, bl_out, rep_out = optimize(
+                    res, bl_out, rep_out, skip_reason = optimize(
                         f"{site}__{meter_num}", display_svc, meter_data, bl_count, r2_thresh)
 
                 if res is None:
+                    # No model could be fit (insufficient baseline data, no
+                    # combination passed quality gates, etc.). Previously this
+                    # site/meter vanished from every output table with zero
+                    # trace. Now: still record it in all_models (with
+                    # model-dependent columns blank, see build_skipped_model_row),
+                    # so the user can distinguish "skipped, here's why" from
+                    # "succeeded." The skip is NOT also written to outliers — that
+                    # table lists bad BILLS, and a skip is a property of the
+                    # site/meter, not of any one bill.
+                    # Any pre-skip outliers gathered (bl_out/rep_out, e.g. NaN-
+                    # weather drops) are still recorded too, same as before.
+                    # The raw bills themselves still flow into baseline_bills/
+                    # reporting_bills (no model, so Predicted Consumption etc.
+                    # stay blank) so the bills aren't invisible just because
+                    # no model could be fit from them.
+                    skip_row = build_skipped_model_row(
+                        site, meter_num, "Individual", display_svc, skip_reason)
+                    all_model_rows.append(skip_row)
+                    skip_bl_rows, skip_rep_rows = build_skip_bill_rows(
+                        meter_data, site, display_svc,
+                        f"Excluded: No model fit — {skip_reason}. See all_models/outliers for detail.")
+                    baseline_bill_rows  += skip_bl_rows
+                    reporting_bill_rows += skip_rep_rows
+                    for o in bl_out + rep_out:
+                        outlier_rows.append(build_outlier_row(o, site, meter_num, display_svc))
                     continue
 
                 row = build_result_row(res, site, meter_num, "Individual",
                                        display_svc, bl_count, concurrent, sequential)
-                individual_rows.append(row)
+                all_model_rows.append(row)
                 ind_results_for_site.append((meter_num, res, row))
 
                 baseline_bill_rows  += build_baseline_rows(res, site, meter_num, display_svc)
@@ -1078,9 +2573,27 @@ def run_analysis(df: pd.DataFrame,
                     savings_status=row["Savings Status"])
 
                 for _, _sr in res["selected"].iterrows():
+                    sel_date = str(pd.to_datetime(_sr["Period_Start_Date"]).date())
                     selected_baseline_keys.add(
-                        (str(site), str(meter_num),
-                         str(pd.to_datetime(_sr["Period_Start_Date"]).date())))
+                        (str(site), str(meter_num), sel_date))
+                    # Sequential meters: the concatenated meter label (e.g.
+                    # "P068071, P159012") won't match any individual input row
+                    # in build_input_with_baseline because input rows still
+                    # carry their original meter numbers. Resolve back to the
+                    # original meter(s) that contributed to each selected period
+                    # by matching site + period start date against site_data
+                    # (which still has original per-meter rows). Since sequential
+                    # meters are non-overlapping by definition, each period maps
+                    # to exactly one original meter.
+                    if sequential:
+                        matching = site_data[
+                            site_data["Period_Start_Date"].apply(
+                                lambda d: str(pd.to_datetime(d).date())
+                            ) == sel_date
+                        ]
+                        for orig_meter in matching["Meter_Number"].dropna().unique():
+                            selected_baseline_keys.add(
+                                (str(site), str(orig_meter), sel_date))
 
                 for o in bl_out + rep_out:
                     outlier_rows.append(build_outlier_row(o, site, meter_num, display_svc))
@@ -1088,7 +2601,7 @@ def run_analysis(df: pd.DataFrame,
             # Meter weighting (concurrent only)
             if concurrent and meter_count > 1 and ind_results_for_site:
                 mw = calc_meter_weights(site_data, [m for m, _, _ in ind_results_for_site])
-                for r in individual_rows:
+                for r in all_model_rows:
                     if (r["Site Name"] == site and r["Service Type"] == display_svc
                             and r["Model Type"] == "Individual"):
                         w = mw.get(str(r["Meter Number"]), 0.0)
@@ -1099,62 +2612,249 @@ def run_analysis(df: pd.DataFrame,
 
             # Aggregated model (concurrent only)
             if concurrent and meter_count > 1:
-                agg_data = aggregate_site(site_data)
-                res, bl_out, rep_out = optimize(
-                    f"{site}__AGGREGATED", display_svc, agg_data, bl_count, r2_thresh)
+                # Only pool meters that individually clear the baseline-bill-
+                # count threshold (12 electric / 8 gas) into the aggregate.
+                # Concurrent meters share billing periods rather than adding
+                # to them, so a meter that's short on its own clean baseline
+                # bills can pull an otherwise-solid aggregate down to its own
+                # shortfall if it's pooled in unconditionally. Quality
+                # (R²/CV-RMSE/weather coverage) is deliberately NOT part of
+                # this gate — see _meets_individual_baseline_count — a meter
+                # that fails quality individually can still be aggregated,
+                # since combining it with others may still produce a model
+                # that passes.
+                qualifying_meters = [
+                    m for m in meter_nums
+                    if _meets_individual_baseline_count(
+                        site_data[site_data["Meter_Number"] == m], is_gas, bl_count)
+                ]
+                agg_meter_count = len(qualifying_meters)
 
-                if res is not None:
-                    row       = build_result_row(res, site, f"AGGREGATED ({meter_count})",
-                                                 "Aggregated", display_svc, bl_count, concurrent, False)
-                    agg_flag, weight_note = failing_weight_flag(mw, ind_results_for_site)
-                    qual_note = build_notes(ind_results_for_site, res, meter_count)
-                    row["Weight Flag"] = agg_flag
-                    row["Notes"]       = " | ".join(filter(None, [qual_note, weight_note]))
-
-                    for r in individual_rows:
-                        if (r["Site Name"] == site and r["Service Type"] == display_svc
-                                and r["Model Type"] == "Individual"):
-                            r["Notes"] = row["Notes"]
-
-                    aggregated_rows.append(row)
-                    meter_weight_rows.extend(
-                        build_meter_weight_rows(site, display_svc, mw,
-                                                ind_results_for_site, site_data, agg_flag))
-
-                    baseline_bill_rows  += build_baseline_rows(
-                        res, site, f"AGGREGATED ({meter_count})", display_svc)
-                    reporting_bill_rows += build_reporting_rows(
-                        res, site, f"AGGREGATED ({meter_count})", display_svc,
-                        model_passes=row["Model Passes Quality"],
-                        savings_status=row["Savings Status"])
-
-                    for _, _sr in res["selected"].iterrows():
-                        selected_baseline_keys.add(
-                            (str(site), "AGGREGATED",
-                             str(pd.to_datetime(_sr["Period_Start_Date"]).date())))
-
-                    for o in bl_out + rep_out:
-                        outlier_rows.append(
-                            build_outlier_row(o, site, f"AGGREGATED ({meter_count})", display_svc))
-                else:
+                if agg_meter_count < 2:
+                    # Not enough qualifying meters to build a meaningful
+                    # aggregate (need at least 2). Record why in
+                    # all_models/outliers, same as any other
+                    # no-model-fit case — but skip adding bare bill rows
+                    # here, since there's no real combined-bill series to
+                    # show (the individual meters' own bills are already
+                    # represented in baseline_bills/reporting_bills from the
+                    # per-meter loop above).
+                    skip_reason = (
+                        f"Only {agg_meter_count}/{meter_count} meter(s) individually "
+                        f"reach the {bl_count}-bill baseline count required for "
+                        f"{display_svc}; at least 2 qualifying meters are needed "
+                        f"to build an aggregate."
+                    )
+                    skip_row = build_skipped_model_row(
+                        site, f"AGGREGATED ({meter_count})", "Aggregated",
+                        display_svc, skip_reason)
+                    all_model_rows.append(skip_row)
+                    # Third and last path that can emit an aggregate row: the
+                    # per-meter baseline count gate blocked aggregation before
+                    # optimize() was ever reached. It still produces an
+                    # "Aggregated" row, so it belongs in aggregated_models like
+                    # the other two paths.
+                    aggregated_rows.append(skip_row)
                     if mw:
                         meter_weight_rows.extend(
                             build_meter_weight_rows(site, display_svc, mw,
                                                     ind_results_for_site, site_data, "NO AGG MODEL"))
+                else:
+                    # Drop any period where not all pooled meters have a bill
+                    # BEFORE summing. An incomplete period under-states site
+                    # load and — because meter presence tends to track the
+                    # calendar — biases the weather coefficients rather than
+                    # just adding noise. See drop_incomplete_meter_periods.
+                    agg_source = site_data[
+                        site_data["Meter_Number"].isin(qualifying_meters)]
+                    agg_source, coverage_note = drop_incomplete_meter_periods(
+                        agg_source, qualifying_meters)
+                    agg_data = aggregate_site(agg_source, agg_lock_col=AGG_SB_INTERNAL)
+
+                    # Mirrors the per-meter meter_is_locked check above, read off
+                    # the aggregate's OWN column. Until this existed, aggregates
+                    # always called optimize() and re-picked their baseline from
+                    # scratch on every run — so an aggregate's baseline could
+                    # legitimately move between two runs of identical data, which
+                    # is not defensible for a frozen IPMVP baseline. Deciding it
+                    # per site (not file-wide) means a file mixing reviewed and
+                    # un-reviewed aggregates behaves correctly: locked ones
+                    # reconstruct, the rest optimize fresh.
+                    agg_is_locked = (
+                        "Selected_Baseline" in agg_data.columns
+                        and (agg_data["Selected_Baseline"] == "1").any()
+                    )
+                    if agg_is_locked:
+                        res, bl_out, rep_out, skip_reason = optimize_from_locked(
+                            f"{site}__AGGREGATED", display_svc, agg_data, r2_thresh)
+                    else:
+                        res, bl_out, rep_out, skip_reason = optimize(
+                            f"{site}__AGGREGATED", display_svc, agg_data, bl_count, r2_thresh)
+
+                    if res is not None:
+                        row       = build_result_row(res, site, f"AGGREGATED ({agg_meter_count})",
+                                                     "Aggregated", display_svc, bl_count, concurrent, False)
+                        agg_flag, weight_note = failing_weight_flag(mw, ind_results_for_site)
+                        qual_note = build_notes(ind_results_for_site, res, meter_count)
+                        row["Weight Flag"] = agg_flag
+                        row["Notes"]       = " | ".join(filter(None, [qual_note, weight_note]))
+                        if agg_meter_count < meter_count:
+                            row["Notes"] = " | ".join(filter(None, [row["Notes"],
+                                f"Aggregate built from {agg_meter_count}/{meter_count} meters — "
+                                f"{meter_count - agg_meter_count} excluded for not individually "
+                                f"reaching the {bl_count}-bill baseline count"
+                            ]))
+                        # Incomplete-period exclusions are reported even when the
+                        # model still fits, so the analyst can see the aggregate
+                        # was built on fewer periods than the raw bill count implies.
+                        if coverage_note:
+                            row["Notes"] = " | ".join(
+                                filter(None, [row["Notes"], coverage_note]))
+
+                        for r in all_model_rows:
+                            if (r["Site Name"] == site and r["Service Type"] == display_svc
+                                    and r["Model Type"] == "Individual"):
+                                r["Notes"] = row["Notes"]
+
+                        aggregated_rows.append(row)
+                        # Also surface the aggregate in all_models, so a
+                        # site's meters and its aggregate can be compared side by
+                        # side in one table.
+                        #
+                        # This corrects an inversion, not just a display gap. The
+                        # routing used to be exactly backwards: a FAILED aggregate
+                        # landed in all_models (via the skip branch below)
+                        # while a SUCCESSFUL one went only to aggregated_models. So
+                        # all_models listed an aggregate for URB003/URB007
+                        # (both failures) but not for URB002/URB009/URB013 (all
+                        # successes) — the aggregate appeared precisely when there
+                        # was nothing useful to show. Every aggregate now appears
+                        # in all_models regardless of outcome.
+                        #
+                        # The same dict object is deliberately appended to BOTH
+                        # lists rather than a copy: it is one row shown in two
+                        # places, and _apply_site_meter_key_and_recommended mutates
+                        # rows in place afterwards. Sharing keeps the two tables in
+                        # sync by construction. That function tolerates a row
+                        # appearing twice in all_model_rows + aggregated_rows —
+                        # its three passes are a set-add, a direct assignment, and
+                        # a dict comprehension keyed on
+                        # (Site Name, Meter Number, Service Type), all idempotent.
+                        #
+                        # NOTE: aggregated_models is unchanged and still holds only
+                        # successful aggregates, so the row now appears in two
+                        # tables. Safe today because the KPI tiles source from
+                        # reporting_bills, not from a union of the model tables —
+                        # but anything that UNIONs all_models with
+                        # aggregated_models would now double-count these rows.
+                        all_model_rows.append(row)
+                        meter_weight_rows.extend(
+                            build_meter_weight_rows(site, display_svc, mw,
+                                                    ind_results_for_site, site_data, agg_flag))
+
+                        baseline_bill_rows  += build_baseline_rows(
+                            res, site, f"AGGREGATED ({agg_meter_count})", display_svc,
+                            is_aggregate=True)
+                        reporting_bill_rows += build_reporting_rows(
+                            res, site, f"AGGREGATED ({agg_meter_count})", display_svc,
+                            model_passes=row["Model Passes Quality"],
+                            savings_status=row["Savings Status"])
+
+                        for _, _sr in res["selected"].iterrows():
+                            sel_date = str(pd.to_datetime(_sr["Period_Start_Date"]).date())
+                            # Resolve the synthetic "AGGREGATED" label back to the
+                            # real meters pooled into this period — the same thing
+                            # the sequential path above does for its concatenated
+                            # label. Input rows carry real meter numbers, never
+                            # "AGGREGATED", so storing a bare
+                            # (site, "AGGREGATED", date) key forced
+                            # build_input_with_baseline to fall back on a
+                            # site+date-only match. That fallback ignored Service
+                            # Type and stamped an ELECTRIC aggregate's selections
+                            # onto the site's GAS rows sharing a period start —
+                            # observed at URB013, where the gas meter's locked
+                            # baseline grew from 11 bills to 12 on write-out.
+                            # agg_source is already scoped to this site, this
+                            # service type, and only the qualifying meters, so
+                            # resolving through it cannot cross those boundaries.
+                            matching = agg_source[
+                                agg_source["Period_Start_Date"].apply(
+                                    lambda d: str(pd.to_datetime(d).date())
+                                ) == sel_date
+                            ]
+                            for orig_meter in matching["Meter_Number"].dropna().unique():
+                                aggregated_baseline_keys.add(
+                                    (str(site), str(orig_meter), sel_date))
+
+                        for o in bl_out + rep_out:
+                            outlier_rows.append(
+                                build_outlier_row(o, site, f"AGGREGATED ({agg_meter_count})", display_svc))
+                    else:
+                        # Aggregated model couldn't be fit either — same skip-row
+                        # treatment as the individual-meter case, so this is
+                        # visible in all_models/outliers instead of just
+                        # silently producing no aggregated_models row.
+                        #
+                        # If we dropped incomplete periods above, say so. Without
+                        # this the skip reason reads "Insufficient baseline data:
+                        # only 9 clean baseline bill(s) ... 12 required", which is
+                        # true but hides the actual cause — the site HAS 12 raw
+                        # periods, 3 of them just aren't whole.
+                        if coverage_note:
+                            skip_reason = f"{skip_reason} | {coverage_note}"
+                        skip_row = build_skipped_model_row(
+                            site, f"AGGREGATED ({agg_meter_count})", "Aggregated",
+                            display_svc, skip_reason)
+                        all_model_rows.append(skip_row)
+                        # Symmetry with the success branch above: an aggregate row
+                        # now lands in BOTH tables whatever the outcome. Previously
+                        # a failed aggregate appeared only in all_models and a
+                        # successful one only in aggregated_models, so neither
+                        # table was a complete picture — aggregated_models silently
+                        # omitted every aggregate that couldn't be fit, which is
+                        # exactly the case an analyst most needs to see.
+                        # Same shared-dict rationale as the success branch.
+                        aggregated_rows.append(skip_row)
+                        skip_bl_rows, skip_rep_rows = build_skip_bill_rows(
+                            agg_data, site, display_svc,
+                            f"Excluded: No aggregated model fit — {skip_reason}. See all_models/outliers for detail.")
+                        baseline_bill_rows  += skip_bl_rows
+                        reporting_bill_rows += skip_rep_rows
+                        for o in bl_out + rep_out:
+                            outlier_rows.append(
+                                build_outlier_row(o, site, f"AGGREGATED ({agg_meter_count})", display_svc))
+                        if mw:
+                            meter_weight_rows.extend(
+                                build_meter_weight_rows(site, display_svc, mw,
+                                                        ind_results_for_site, site_data, "NO AGG MODEL"))
+
+    # Stamp Site Meter Key / Recommended across all four tables now that every
+    # site's individual + aggregate attempts (and their corresponding bill
+    # rows) are fully built. See _apply_site_meter_key_and_recommended for
+    # the precedence rule.
+    _apply_site_meter_key_and_recommended(all_model_rows, aggregated_rows,
+                                          baseline_bill_rows, reporting_bill_rows)
 
     run_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    ind_df = _safe_df(individual_rows, "model")
-    if len(ind_df) > 0:
-        ind_df["Last Run Timestamp"] = run_timestamp
+    all_models_df = _safe_df(all_model_rows, "model")
+    if len(all_models_df) > 0:
+        all_models_df["Last Run Timestamp"] = run_timestamp
 
     return {
-        "individual_models":   ind_df,
+        "all_models":   all_models_df,
         "aggregated_models":   _safe_df(aggregated_rows,    "model"),
         "baseline_bills":      _safe_df(baseline_bill_rows,  "bills"),
         "reporting_bills":     _safe_df(reporting_bill_rows, "bills"),
         "outliers":            _safe_df(outlier_rows,        "outliers"),
         "meter_weights":       _safe_df(meter_weight_rows,   "weights"),
-        "input_with_baseline": build_input_with_baseline(df_original, selected_baseline_keys),
+        "input_with_baseline": build_input_with_baseline(
+            df_original, selected_baseline_keys, cost_only_flagged_sites,
+            aggregated_baseline_keys),
+        "cost_only_review":    _safe_df(
+            build_cost_only_review_rows(
+                cost_only_flagged_sites,
+                _compute_consolidated_sites(df_original, cost_only_flagged_sites)),
+            "cost_only_review"),
     }
 
 
@@ -1236,9 +2936,14 @@ def aggregate_weather_to_periods(daily_df: pd.DataFrame,
     back to the billing DataFrame correctly.
 
     Returns a DataFrame with columns:
-        Site_Name, Period Start Date, HDD_sigma, CDD_sigma
-    One row per unique (Site_Name, Period Start Date) combination.
-    Periods with no daily coverage produce NaN for both columns.
+        Site_Name, Period Start Date, Period End Date, HDD_sigma, CDD_sigma
+    One row per unique (Site_Name, Period Start Date, Period End Date)
+    combination. Period End Date is included in the output (and used by
+    merge_weather as a join key) because different service types at the same
+    site can share the same Period Start Date but have different Period End
+    Dates. Without it, merge_weather would fan out a 1:many join and
+    duplicate billing rows. Periods with no daily coverage produce NaN for
+    both HDD/CDD columns.
     """
     period_keys = (
         billing_df[["Site_Name", "WeatherStation", "Period_Start_Date", "Period_End_Date"]]
@@ -1248,7 +2953,7 @@ def aggregate_weather_to_periods(daily_df: pd.DataFrame,
 
     if len(period_keys) == 0 or len(daily_df) == 0:
         return pd.DataFrame(columns=["Site_Name", "Period Start Date",
-                                     "HDD_sigma", "CDD_sigma"])
+                                     "Period End Date", "HDD_sigma", "CDD_sigma"])
 
     agg_rows = []
     for _, pk in period_keys.iterrows():
@@ -1265,6 +2970,7 @@ def aggregate_weather_to_periods(daily_df: pd.DataFrame,
         agg_rows.append({
             "Site_Name":         site,
             "Period Start Date": p_start,
+            "Period End Date":   p_end,
             "HDD_sigma":         subset["Hdd Lt 65 F"].sum() if len(subset) > 0 else np.nan,
             "CDD_sigma":         subset["Cdd Gt 65 F"].sum() if len(subset) > 0 else np.nan,
         })
@@ -1277,9 +2983,15 @@ def merge_weather(billing_df: pd.DataFrame,
     """
     Merge Sigma-sourced HDD/CDD into the billing DataFrame.
 
-    Joins on (Site_Name, Period_Start_Date). The weather_df produced by
-    aggregate_weather_to_periods is already keyed on Site_Name (resolved via
-    WeatherStation → Icao Id), so no site name translation is needed here.
+    Joins on (Site_Name, Period_Start_Date, Period_End_Date). The weather_df
+    produced by aggregate_weather_to_periods is already keyed on Site_Name
+    (resolved via WeatherStation → Icao Id), so no site name translation is
+    needed here. Period_End_Date is included in the join because different
+    service types at the same site can share the same Period_Start_Date but
+    have different Period_End_Dates (e.g. electric billed to 09/24, gas to
+    09/25). Without it, the left join fans out 1:many and duplicates billing
+    rows — each duplicate carrying a slightly different HDD/CDD from the
+    different-length aggregation window.
 
     Resolution order per row:
       1. Sigma value (HDD_sigma / CDD_sigma) — used when non-null.
@@ -1296,16 +3008,23 @@ def merge_weather(billing_df: pd.DataFrame,
     weather_df["Period Start Date"] = pd.to_datetime(
         weather_df["Period Start Date"], errors="coerce", utc=False
     )
+    weather_df["Period End Date"] = pd.to_datetime(
+        weather_df["Period End Date"], errors="coerce", utc=False
+    )
 
     df["_join_start"] = pd.to_datetime(
         df["Period_Start_Date"], errors="coerce", utc=False
     )
+    df["_join_end"] = pd.to_datetime(
+        df["Period_End_Date"], errors="coerce", utc=False
+    )
 
     merged = df.merge(
         weather_df.rename(columns={"Period Start Date": "_join_start",
+                                   "Period End Date": "_join_end",
                                    "Site_Name": "_weather_site"}),
-        left_on=["Site_Name", "_join_start"],
-        right_on=["_weather_site", "_join_start"],
+        left_on=["Site_Name", "_join_start", "_join_end"],
+        right_on=["_weather_site", "_join_start", "_join_end"],
         how="left",
     ).drop(columns=["_weather_site"], errors="ignore")
 
@@ -1351,7 +3070,7 @@ def merge_weather(billing_df: pd.DataFrame,
 
     merged = merged.drop(
         columns=[c for c in ["HDD_sigma", "CDD_sigma", "HDD_csv",
-                             "CDD_csv", "_join_start"] if c in merged.columns]
+                             "CDD_csv", "_join_start", "_join_end"] if c in merged.columns]
     )
     return merged
 
@@ -1359,31 +3078,65 @@ def merge_weather(billing_df: pd.DataFrame,
 # ── Sigma entry point ─────────────────────────────────────────────────────────
 
 def _sigma_main():
-    if WEATHER_SOURCE == "csv":
-        _raw     = sigma.get_element('Uploaded File')  # Raw upload; bypasses Sigma weather join
+    if SIGMA_INPUT_ELEMENT == "Uploaded File":
+        _raw     = sigma.get_element('Uploaded File')  # Must be a string literal (Sigma requirement)
         input_df = _raw.to_pandas(block=False).result()
         results  = run_analysis(input_df)
-    else:
+
+    elif SIGMA_INPUT_ELEMENT == "Input_GEM":
+        _raw     = sigma.get_element('Input_GEM')  # Must be a string literal (Sigma requirement)
+        assert 'Input_GEM' == SIGMA_INPUT_ELEMENT, \
+            f"SIGMA_INPUT_ELEMENT ('{SIGMA_INPUT_ELEMENT}') does not match the literal in get_element(). Update both together."
+        input_df = _raw.to_pandas(block=False).result()
+
+        proc_df, df_original, has_locked, cost_only_flagged_sites = preprocess(input_df)
+        daily_weather_df = fetch_sigma_weather()
+        weather_df       = aggregate_weather_to_periods(daily_weather_df, proc_df)
+        proc_df          = merge_weather(proc_df, weather_df)
+        # df_original was snapshotted inside preprocess(), i.e. BEFORE the line
+        # above enriched proc_df's weather. Without this, input_with_baseline
+        # publishes the Input table's raw HDD/CDD rather than the values the
+        # models were fitted on. See backfill_original_weather.
+        df_original      = backfill_original_weather(df_original, proc_df)
+        results          = run_analysis(proc_df, already_preprocessed=True,
+                                        df_original=df_original,
+                                        has_locked=has_locked,
+                                        cost_only_flagged_sites=cost_only_flagged_sites)
+
+    elif SIGMA_INPUT_ELEMENT == "Input":
         _raw     = sigma.get_element('Input')  # Must be a string literal (Sigma requirement)
         assert 'Input' == SIGMA_INPUT_ELEMENT, \
             f"SIGMA_INPUT_ELEMENT ('{SIGMA_INPUT_ELEMENT}') does not match the literal in get_element(). Update both together."
         input_df = _raw.to_pandas(block=False).result()
 
-        proc_df, df_original, has_locked = preprocess(input_df)
+        proc_df, df_original, has_locked, cost_only_flagged_sites = preprocess(input_df)
         daily_weather_df = fetch_sigma_weather()
         weather_df       = aggregate_weather_to_periods(daily_weather_df, proc_df)
         proc_df          = merge_weather(proc_df, weather_df)
+        # df_original was snapshotted inside preprocess(), i.e. BEFORE the line
+        # above enriched proc_df's weather. Without this, input_with_baseline
+        # publishes the Input table's raw HDD/CDD rather than the values the
+        # models were fitted on. See backfill_original_weather.
+        df_original      = backfill_original_weather(df_original, proc_df)
         results          = run_analysis(proc_df, already_preprocessed=True,
                                         df_original=df_original,
-                                        has_locked=has_locked)
+                                        has_locked=has_locked,
+                                        cost_only_flagged_sites=cost_only_flagged_sites)
 
-    sigma.output('individual_models',   results['individual_models'])
+    else:
+        raise ValueError(
+            f"Unrecognized SIGMA_INPUT_ELEMENT: '{SIGMA_INPUT_ELEMENT}'. "
+            f"Expected one of: 'Input', 'Input_GEM', 'Uploaded File'."
+        )
+
+    sigma.output('all_models',   results['all_models'])
     sigma.output('aggregated_models',   results['aggregated_models'])
     sigma.output('baseline_bills',      results['baseline_bills'])
     sigma.output('reporting_bills',     results['reporting_bills'])
     sigma.output('outliers',            results['outliers'])
     sigma.output('meter_weights',       results['meter_weights'])
     sigma.output('input_with_baseline', results['input_with_baseline'])
+    sigma.output('cost_only_review',    results['cost_only_review'])
 
 
 # ── Local entry point ─────────────────────────────────────────────────────────
